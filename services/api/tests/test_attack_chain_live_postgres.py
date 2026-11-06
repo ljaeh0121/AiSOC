@@ -262,3 +262,52 @@ async def test_a_sweep_that_exactly_fits_its_limit_is_not_truncated_in_postgres(
     assert chain is not None
     assert chain.truncated is False
     assert len(chain.chain) == 3
+
+
+async def test_stored_values_match_regardless_of_their_case(world) -> None:
+    """Fusion writes ``affected_*`` verbatim, so two connectors name the same
+    person ``JDoe@Acme.Test`` and ``jdoe@acme.test``."""
+    maker, a, _b, insert = world
+    seed = _alert(a, "seed", 0, affected_users=("jdoe@acme.test",), affected_hosts=("win-usr-101",))
+    other_user = _alert(a, "okta", 5, affected_users=("JDoe@Acme.Test",))
+    other_host = _alert(a, "edr", 6, affected_hosts=("WIN-USR-101",))
+    await insert(seed, other_user, other_host)
+
+    chain = await _chain(maker, a, seed.id)
+
+    assert chain is not None
+    assert {link.alert_id for link in chain.chain} == {other_user.id, other_host.id}
+
+
+async def test_a_row_with_a_malformed_entity_column_does_not_break_the_sweep(world) -> None:
+    maker, a, _b, insert = world
+    seed = _alert(a, "seed", 0, affected_users=("jdoe@acme.test",))
+    good = _alert(a, "good", 5, affected_users=("jdoe@acme.test",))
+    await insert(seed, good)
+    async with maker() as db:
+        for bad in ('"just-a-string"', '{"not": "a list"}', "42", "null"):
+            await db.execute(
+                text(
+                    "INSERT INTO alerts (id, tenant_id, title, severity, status, event_time, affected_users)"
+                    " VALUES (:i, :t, 'malformed', 'low', 'new', :et, CAST(:v AS JSONB))"
+                ),
+                {"i": uuid.uuid4(), "t": a, "et": T0 + timedelta(minutes=1), "v": bad},
+            )
+        await db.commit()
+
+    chain = await _chain(maker, a, seed.id)
+
+    assert chain is not None
+    assert {link.alert_id for link in chain.chain} == {good.id}
+
+
+async def test_alerts_sharing_only_a_value_that_names_nothing_are_not_linked(world) -> None:
+    maker, a, _b, insert = world
+    seed = _alert(a, "seed", 0, affected_hosts=("localhost",), affected_users=("-",), affected_ips=("127.0.0.1",))
+    other = _alert(a, "other", 5, affected_hosts=("localhost",), affected_users=("-",), affected_ips=("127.0.0.1",))
+    await insert(seed, other)
+
+    chain = await _chain(maker, a, seed.id)
+
+    assert chain is not None
+    assert chain.chain == []

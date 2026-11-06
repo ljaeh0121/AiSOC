@@ -1,6 +1,8 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { render, screen, within } from '@testing-library/react';
-import type { AttackChainTimeline, Case } from '@/lib/api';
+import { casesApi, type AttackChainTimeline, type Case } from '@/lib/api';
 import { __setDemoModeForTests } from '@/lib/demoMode';
 
 // We mock SWR rather than the real network layer so the test stays
@@ -216,21 +218,13 @@ describe('CaseWorkspace', () => {
         seedAlertId: 'alert-seed',
         chainSignature: 'sig-xyz',
         confidence: 0.82,
+        truncated: false,
+        truncatedReasons: [],
+        suppressedPivots: [],
         generatedAt: now,
+        // The seed is not a member of the chain; the API returns only the
+        // alerts related to it.
         chain: [
-          {
-            alertId: 'alert-seed',
-            title: 'Seed — Suspicious PowerShell on FIN-WS-01',
-            severity: 'critical',
-            eventTime: now,
-            score: 1.0,
-            distance: 0,
-            dtSeconds: 0,
-            sharedEntities: [],
-            mitreTechniques: ['T1059.001'],
-            connectorType: 'edr',
-            sourceEventIds: ['evt-1'],
-          },
           {
             alertId: 'alert-2',
             title: 'Lateral SMB session to FIN-DB-02',
@@ -243,31 +237,216 @@ describe('CaseWorkspace', () => {
             mitreTechniques: ['T1021.002'],
             connectorType: 'edr',
             sourceEventIds: ['evt-2'],
+            viaAlertId: null,
+            strength: 0.9,
+            stage: 9,
+            tactic: 'lateral-movement',
+            outOfSequence: false,
           },
         ],
         entityGraph: {
           nodes: [
-            { id: 'alert-seed', kind: 'alert', severity: 'critical', event_time: now },
-            { id: 'alert-2', kind: 'alert', severity: 'high' },
+            {
+              id: 'alert:alert-seed',
+              kind: 'Alert',
+              label: 'Seed — Suspicious PowerShell on FIN-WS-01',
+              severity: 'critical',
+              event_time: now,
+            },
+            { id: 'alert:alert-2', kind: 'Alert', severity: 'high' },
             { id: 'user:svc-finance', kind: 'user', label: 'svc-finance' },
           ],
-          edges: [{ source: 'alert-seed', target: 'alert-2', kind: 'shares_entity' }],
+          edges: [{ source: 'alert:alert-2', target: 'user:svc-finance', kind: 'TOUCHES' }],
         },
       };
       swrState.attackChainData = timeline;
 
       render(<CaseWorkspace caseId="INC-001" />);
 
-      // Both chain links should render.
-      expect(screen.getByText(/Seed — Suspicious PowerShell on FIN-WS-01/i)).toBeInTheDocument();
+      // The seed is named in its own header; the chain holds the related alert.
+      expect(screen.getByTestId('chain-seed')).toHaveTextContent(
+        /Seed — Suspicious PowerShell on FIN-WS-01/i,
+      );
       expect(screen.getByText(/Lateral SMB session to FIN-DB-02/i)).toBeInTheDocument();
 
       // Confidence is surfaced as a percentage to the analyst.
       expect(screen.getByText(/82%/)).toBeInTheDocument();
 
       // MITRE techniques from the chain should be visible.
-      expect(screen.getByText('T1059.001')).toBeInTheDocument();
       expect(screen.getByText('T1021.002')).toBeInTheDocument();
+    });
+
+    describe('what the analyst is told about the chain', () => {
+      const FIXTURE = JSON.parse(
+        readFileSync(
+          resolve(
+            __dirname,
+            '../../../../../services/api/tests/fixtures/attack_chain_response.json',
+          ),
+          'utf8',
+        ),
+      );
+
+      // The body the API really sends, through the real mapper.
+      async function load(patch: (body: any) => void = () => {}): Promise<AttackChainTimeline> {
+        const body = structuredClone(FIXTURE);
+        patch(body);
+        vi.stubGlobal(
+          'fetch',
+          vi.fn().mockResolvedValue({
+            ok: true,
+            status: 200,
+            statusText: 'OK',
+            headers: new Headers({ 'content-type': 'application/json' }),
+            json: async () => body,
+            text: async () => JSON.stringify(body),
+          } as unknown as Response),
+        );
+        const timeline = await casesApi.getAttackChain('INC-001');
+        vi.unstubAllGlobals();
+        return timeline!;
+      }
+
+      const show = (timeline: AttackChainTimeline) => {
+        swrState.attackChainData = timeline;
+        render(<CaseWorkspace caseId="INC-001" />);
+      };
+      const card = (timeline: AttackChainTimeline, titlePrefix: string) =>
+        screen.getByTestId(
+          `chain-link-${timeline.chain.find((l) => l.title.startsWith(titlePrefix))!.alertId}`,
+        );
+
+      it('names the real seed alert and does not call the first link the seed', async () => {
+        const timeline = await load();
+        show(timeline);
+
+        expect(screen.getByTestId('chain-seed')).toHaveTextContent(
+          'Phishing email with malicious attachment delivered',
+        );
+        expect(screen.queryByText(/^seed$/i)).not.toBeInTheDocument();
+      });
+
+      it('labels each link with its ATT&CK tactic', async () => {
+        const timeline = await load();
+        show(timeline);
+
+        expect(within(card(timeline, 'Credential')).getByText(/initial access/i)).toBeInTheDocument();
+        expect(within(card(timeline, 'S3 bucket')).getByText(/discovery/i)).toBeInTheDocument();
+        expect(within(card(timeline, 'Large outbound')).getByText(/collection/i)).toBeInTheDocument();
+      });
+
+      it('says so when no technique could be placed on the kill chain', async () => {
+        const timeline = await load((b) => {
+          b.chain[0].stage = null;
+          b.chain[0].tactic = null;
+        });
+        show(timeline);
+
+        expect(within(card(timeline, 'Credential')).getByText(/no tactic/i)).toBeInTheDocument();
+      });
+
+      it('marks only the links whose stage order contradicts the clock', async () => {
+        const clean = await load();
+        show(clean);
+        expect(screen.queryByText(/out of sequence/i)).not.toBeInTheDocument();
+      });
+
+      it('flags a link that happened before one it follows in stage order', async () => {
+        const timeline = await load((b) => {
+          b.chain[3].out_of_sequence = true;
+        });
+        show(timeline);
+
+        expect(screen.getAllByText(/out of sequence/i)).toHaveLength(1);
+        expect(within(card(timeline, 'Large outbound')).getByText(/out of sequence/i)).toBeInTheDocument();
+      });
+
+      it('names the alert that bridged a deeper link in', async () => {
+        const timeline = await load();
+        show(timeline);
+
+        expect(within(card(timeline, 'S3 bucket')).getByText(/via/i)).toHaveTextContent(
+          'Cloud auth anomaly: impossible-travel sign-in to AWS console',
+        );
+        expect(within(card(timeline, 'Credential')).queryByText(/^via/i)).not.toBeInTheDocument();
+      });
+
+      it('measures time from the seed, not from the previous link', async () => {
+        const timeline = await load();
+        show(timeline);
+
+        // The credential-harvest alert is 5 minutes after the seed.
+        expect(within(card(timeline, 'Credential')).getByText('±5m from seed')).toBeInTheDocument();
+      });
+
+      it('shows how strong the evidence for each link is', async () => {
+        const timeline = await load();
+        show(timeline);
+
+        expect(within(card(timeline, 'Credential')).getByText(/evidence 96%/i)).toBeInTheDocument();
+        expect(within(card(timeline, 'S3 bucket')).getByText(/evidence 43%/i)).toBeInTheDocument();
+      });
+
+      it('explains what the confidence figure is', async () => {
+        const timeline = await load();
+        show(timeline);
+
+        expect(screen.getByTitle(/mean evidence strength.*not a calibrated probability/i)).toBeInTheDocument();
+      });
+
+      it('warns that a truncated chain is not the whole picture, and why', async () => {
+        const timeline = await load((b) => {
+          b.truncated = true;
+          b.truncated_reasons = ['sweep_limit', 'max_length'];
+        });
+        show(timeline);
+
+        const banner = screen.getByTestId('chain-truncated');
+        expect(banner).toHaveTextContent(/incomplete/i);
+        expect(banner).toHaveTextContent(/row limit/i);
+        expect(banner).toHaveTextContent(/length cap/i);
+      });
+
+      it('shows no warning for a complete chain', async () => {
+        const timeline = await load();
+        show(timeline);
+
+        expect(screen.queryByTestId('chain-truncated')).not.toBeInTheDocument();
+      });
+
+      it('does not claim completeness when the API does not say', async () => {
+        const timeline = await load((b) => {
+          delete b.truncated;
+          delete b.truncated_reasons;
+        });
+        show(timeline);
+
+        expect(screen.getByTestId('chain-completeness-unknown')).toBeInTheDocument();
+      });
+
+      it('lists the entities the traversal declined to follow', async () => {
+        const timeline = await load((b) => {
+          b.suppressed_pivots = [
+            { kind: 'Endpoint', value: '198.51.100.9', reason: 'high_fanout', alert_count: 30 },
+            { kind: 'Identity', value: 'system', reason: 'generic_account', alert_count: null },
+          ];
+        });
+        show(timeline);
+
+        const note = screen.getByTestId('chain-suppressed');
+        expect(note).toHaveTextContent('198.51.100.9');
+        expect(note).toHaveTextContent(/30 alerts/i);
+        expect(note).toHaveTextContent('system');
+        expect(note).toHaveTextContent(/shared account/i);
+      });
+
+      it('does not say that MITRE techniques link alerts', async () => {
+        swrState.attackChainData = null;
+        render(<CaseWorkspace caseId="INC-001" />);
+
+        expect(screen.queryByText(/or MITRE techniques/i)).not.toBeInTheDocument();
+        expect(screen.getByText(/share an entity/i)).toBeInTheDocument();
+      });
     });
 
     // Helper: read the active window from the WindowSelector. The UI is a

@@ -23,13 +23,19 @@ the edges from. That denormalised view gives us:
 
 We treat the alerts table as a bipartite (alert ↔ entity) graph, then:
 
-  1. Pull the seed's entity touch-set (``E_seed``).
+  1. Pull the seed's entity touch-set (``E_seed``). Entities are normalised
+     (``normalize_entity``): case and padding never distinguish two of them,
+     IPs compare by address, and values that name nothing (``-``,
+     ``localhost``, loopback/link-local addresses) are dropped.
   2. Sweep all alerts in the window whose ``affected_*`` lists intersect
-     ``E_seed`` — these are the depth-1 candidates.
+     ``E_seed`` — these are the depth-1 candidates. Shared accounts
+     (``SYSTEM``, ``root``, ...) are never followed.
   3. For each candidate, repeat the sweep with *all* of that candidate's
-     entities (depth 2, 3) to expand the neighbourhood. A cumulative
-     ``seen_entities`` set guarantees no entity is queried twice, so the
-     traversal terminates regardless of how dense the graph is.
+     entities (depth 2, 3). A cumulative ``seen_entities`` set guarantees no
+     entity is queried twice. An entity reached by expansion that more than
+     ``HUB_FANOUT`` alerts touch (a NAT address, a jump host) is not followed
+     and is reported in ``suppressed_pivots``; the seed's own entities always
+     are, since a compromised account legitimately has many alerts.
   4. Score each candidate:
 
          score = w1 * (1 / graph_distance)
@@ -38,12 +44,17 @@ We treat the alerts table as a bipartite (alert ↔ entity) graph, then:
 
      where ``risk_overlap`` is the Jaccard similarity of MITRE techniques
      plus shared severity weighting (an explicitly-derived quantity, not
-     a black box — see ``_risk_overlap``). The score decides which links
-     survive the length cap.
+     a black box — see ``_risk_overlap``), and weigh the evidence:
+     ``strength`` combines the kind weight and rarity of each shared entity
+     (two independent matches beat one) and multiplies along the bridge path.
+     The length cap keeps the links with the best ``score * strength``.
   5. Present the survivors in ATT&CK stage order (earliest tactic of any of
      the alert's techniques, then event time); alerts with no placeable
-     technique go last. Compute a stable ``chain_signature`` and a
-     ``confidence`` (the best candidate score — the seed is not a candidate).
+     technique go last, and a link that happened before one it follows is
+     marked ``out_of_sequence``. Compute a stable ``chain_signature`` and a
+     ``confidence``: the mean link strength, so one solid link among many
+     weak ones does not make a confident chain. It is evidence strength, not
+     a calibrated probability.
 
 The algorithm is intentionally pure Python over a small list of
 dictionaries so:
@@ -69,9 +80,11 @@ event.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import logging
 import math
 import uuid
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -116,6 +129,111 @@ W_RISK: float = 0.15
 
 assert math.isclose(W_DISTANCE + W_TEMPORAL + W_RISK, 1.0)
 
+#: An entity that more than this many alerts touch (counted within one sweep)
+#: is a hub — a NAT egress address, a jump host, a shared service identity —
+#: not evidence of one campaign. A hub reached by *expansion* (depth >= 2) is
+#: not followed, and is reported in ``suppressed_pivots``. The seed's own
+#: entities are always followed: a compromised account legitimately has many
+#: alerts, so there density only lowers the link's strength.
+HUB_FANOUT: int = 25
+
+#: Values that name nothing. They never become entities.
+_PLACEHOLDERS: frozenset[str] = frozenset(
+    {"", "-", "--", "?", "*", "n/a", "na", "none", "(none)", "null", "(null)", "nil", "unknown", "<unknown>", "undefined"}
+)
+_LOCAL_HOSTNAMES: frozenset[str] = frozenset({"localhost", "localhost.localdomain", "ip6-localhost"})
+
+#: Accounts shared by many principals or machines. They are real values, so
+#: they stay visible as a shared entity, but they are weak evidence and are
+#: never used to reach further alerts.
+GENERIC_ACCOUNTS: frozenset[str] = frozenset(
+    {
+        "system",
+        "root",
+        "administrator",
+        "admin",
+        "guest",
+        "anonymous",
+        "daemon",
+        "nobody",
+        "service",
+        "local system",
+        "localsystem",
+        "local service",
+        "localservice",
+        "network service",
+        "networkservice",
+    }
+)
+
+
+def is_generic_account(value: str) -> bool:
+    """True for accounts that many people or machines share (``SYSTEM``,
+    ``root``, ``CORP\\Administrator``, ``admin@corp``)."""
+    v = str(value).strip().lower()
+    if v.startswith(("nt authority\\", "nt service\\")):
+        return True
+    local = v.rsplit("\\", 1)[-1].split("@", 1)[0]
+    return local in GENERIC_ACCOUNTS
+
+
+def _normalize_endpoint(v: str) -> str | None:
+    if v.startswith("[") and v.endswith("]"):
+        v = v[1:-1]
+    v = v.split("%", 1)[0]  # IPv6 zone id
+    try:
+        ip = ipaddress.ip_address(v)
+    except ValueError:
+        v = v.rstrip(".")
+        return None if (not v or v in _LOCAL_HOSTNAMES) else v
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if ip.is_unspecified or ip.is_loopback or ip.is_link_local or ip.is_multicast:
+        return None
+    if ip == ipaddress.IPv4Address("255.255.255.255"):
+        return None
+    return str(ip)
+
+
+def normalize_entity(kind: str, value: object) -> str | None:
+    """Canonical form of an entity value, or ``None`` if it names nothing.
+
+    Case and surrounding whitespace never distinguish two entities; IP
+    addresses compare by address, not spelling (``::ffff:1.2.3.4`` is
+    ``1.2.3.4``); loopback, link-local, multicast and unspecified addresses
+    and placeholder strings are not entities at all.
+    """
+    if value is None:
+        return None
+    v = str(value).strip().lower()
+    if v in _PLACEHOLDERS:
+        return None
+    if kind == "Endpoint":
+        return _normalize_endpoint(v)
+    if kind == "Resource":
+        v = v.rstrip("/")
+        return v or None
+    return v
+
+
+def _entity_weight(kind: str, value: str) -> float:
+    """How much one shared entity of this kind says about 'same campaign'."""
+    if kind == "Identity":
+        return 0.15 if is_generic_account(value) else 0.9
+    if kind == "Resource":
+        return 0.8
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return 0.9  # a hostname
+    return 0.5  # an address: NAT, proxies and src/dst ambiguity make it weaker
+
+
+def _rarity(alert_count: int) -> float:
+    """1.0 for an entity only two alerts touch, falling as more do."""
+    return 1.0 / (1.0 + math.log2(max(2, alert_count) / 2.0))
+
+
 #: ATT&CK tactics in kill-chain order. The chain is *presented* in this order
 #: (then by time); the score only decides which links survive the length cap.
 MITRE_TACTIC_ORDER: dict[str, int] = {
@@ -138,6 +256,7 @@ MITRE_TACTIC_ORDER: dict[str, int] = {
 #: Stage given to an alert with no technique we can place. Such alerts stay in
 #: the chain (they are linked by entities, not by MITRE) and sort to the end.
 UNMAPPED_STAGE: int = 999
+_TACTIC_BY_STAGE: dict[int, str] = {i: name for name, i in MITRE_TACTIC_ORDER.items()}
 
 #: Top-level technique id -> index into ``MITRE_TACTIC_ORDER``. A technique that
 #: serves several tactics takes the earliest one. Generated from the ATT&CK
@@ -404,20 +523,18 @@ class CandidateAlert:
     source_event_ids: tuple[str, ...] = ()
 
     def entities(self) -> set[tuple[str, str]]:
-        """Return the set of (kind, value) entity tuples for this alert."""
+        """Return the set of normalised (kind, value) entity tuples."""
         out: set[tuple[str, str]] = set()
-        for v in self.affected_users:
-            if v:
-                out.add(("Identity", str(v)))
-        for v in self.affected_hosts:
-            if v:
-                out.add(("Endpoint", str(v)))
-        for v in self.affected_ips:
-            if v:
-                out.add(("Endpoint", str(v)))
-        for v in self.affected_assets:
-            if v:
-                out.add(("Resource", str(v)))
+        for kind, values in (
+            ("Identity", self.affected_users),
+            ("Endpoint", self.affected_hosts),
+            ("Endpoint", self.affected_ips),
+            ("Resource", self.affected_assets),
+        ):
+            for raw in values:
+                value = normalize_entity(kind, raw)
+                if value:
+                    out.add((kind, value))
         return out
 
 
@@ -440,6 +557,18 @@ class ChainLink:
     #: links (they connect to the seed directly); otherwise a depth-(n-1)
     #: alert, and ``shared_entities`` are the entities shared with *it*.
     via_alert_id: uuid.UUID | None = None
+    #: Strength of the evidence tying this alert to the seed, 0..1: the shared
+    #: entities' kind weight and rarity (combined, so two independent shared
+    #: entities beat one), multiplied hop by hop along ``via_alert_id``. It is
+    #: evidence strength, not a calibrated probability.
+    strength: float = 0.0
+    #: Earliest ATT&CK kill-chain stage index among the alert's techniques and
+    #: its tactic name; ``None`` when no technique can be placed.
+    stage: int | None = None
+    tactic: str | None = None
+    #: True when this link happened *earlier* than a link that precedes it in
+    #: stage order, i.e. the stage narrative contradicts the clock.
+    out_of_sequence: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -455,6 +584,10 @@ class ChainLink:
             "connector_type": self.connector_type,
             "source_event_ids": self.source_event_ids,
             "via_alert_id": str(self.via_alert_id) if self.via_alert_id else None,
+            "strength": round(self.strength, 4),
+            "stage": self.stage,
+            "tactic": self.tactic,
+            "out_of_sequence": self.out_of_sequence,
         }
 
 
@@ -476,6 +609,11 @@ class AttackChain:
     #: it", never "nothing else is related".
     truncated: bool = False
     truncated_reasons: list[str] = field(default_factory=list)
+    #: Entities the traversal declined to follow, each ``{kind, value, reason,
+    #: alert_count}``: ``generic_account`` (shared by many principals) or
+    #: ``high_fanout`` (touched by more than ``HUB_FANOUT`` alerts, reached by
+    #: expansion). Alerts reachable only through them are not in the chain.
+    suppressed_pivots: list[dict[str, Any]] = field(default_factory=list)
     generated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def to_dict(self) -> dict[str, Any]:
@@ -489,6 +627,7 @@ class AttackChain:
             "confidence": round(self.confidence, 4),
             "truncated": self.truncated,
             "truncated_reasons": self.truncated_reasons,
+            "suppressed_pivots": self.suppressed_pivots,
             "generated_at": self.generated_at.isoformat(),
         }
 
@@ -728,24 +867,37 @@ async def compute_attack_chain(
 
     # BFS over the bipartite (alert ↔ entity) graph. ``frontier`` holds the
     # entities to query at this depth; ``seen_entities`` is every entity
-    # already queried, so one never goes back into the frontier. ``known``
+    # already considered, so one never goes back into the frontier. ``known``
     # holds alerts already placed, so none is re-enqueued at a worse distance.
     seed_entities = seed.entities()
     frontier: set[tuple[str, str]] = set(seed_entities)
     seen_entities: set[tuple[str, str]] = set()
     known: dict[uuid.UUID, tuple[CandidateAlert, int]] = {seed.id: (seed, 0)}
     candidate_index: dict[uuid.UUID, CandidateAlert] = {seed.id: seed}
-    # alert id -> (via alert id, entities shared with it); depth-1 links are
-    # tied to the seed itself and carry no intermediary.
+    # alert id -> (bridging alert id, entities shared with it); depth-1 links
+    # are tied to the seed itself and carry no bridge.
     via_of: dict[uuid.UUID, tuple[uuid.UUID | None, set[tuple[str, str]]]] = {}
     by_depth: dict[int, list[CandidateAlert]] = {0: [seed]}
+    # How many known alerts touch each entity: the basis of its rarity.
+    entity_count: Counter[tuple[str, str]] = Counter(seed_entities)
+    suppressed: dict[tuple[str, str], dict[str, Any]] = {}
     sweep_truncated = False
 
     for depth in range(1, max_depth + 1):
         frontier -= seen_entities
+        seen_entities |= frontier
+        # A shared account (SYSTEM, root, ...) is never a pivot: following it
+        # joins every machine's alerts together.
+        for entity in sorted(e for e in frontier if e[0] == "Identity" and is_generic_account(e[1])):
+            suppressed[entity] = {
+                "kind": entity[0],
+                "value": entity[1],
+                "reason": "generic_account",
+                "alert_count": None,
+            }
+            frontier.discard(entity)
         if not frontier:
             break
-        seen_entities |= frontier
         rows = await loader.load_candidates_for_entities(
             tenant_id=tenant_id,
             entities=frontier,
@@ -762,6 +914,20 @@ async def compute_attack_chain(
         if len(rows) > sweep_limit:
             rows = rows[:sweep_limit]
             sweep_truncated = True
+        if depth >= 2:
+            # Expansion reached a hub: keep only alerts that also hang off a
+            # non-hub entity of this frontier, and say what was not followed.
+            matched = Counter(e for r in rows for e in r.entities() & frontier)
+            hubs = {e for e, n in matched.items() if n > HUB_FANOUT}
+            if hubs:
+                for entity in sorted(hubs):
+                    suppressed[entity] = {
+                        "kind": entity[0],
+                        "value": entity[1],
+                        "reason": "high_fanout",
+                        "alert_count": matched[entity],
+                    }
+                rows = [r for r in rows if (r.entities() & frontier) - hubs]
         next_frontier: set[tuple[str, str]] = set()
         for row in rows:
             if row.id in known:
@@ -769,13 +935,15 @@ async def compute_attack_chain(
             known[row.id] = (row, depth)
             candidate_index[row.id] = row
             by_depth.setdefault(depth, []).append(row)
+            entity_count.update(row.entities())
             if depth == 1:
                 via_of[row.id] = (None, row.entities() & seed_entities)
             else:
-                # Bridged in by the earliest depth-(n-1) alert it shares an
-                # entity with (id breaks ties) so the choice is deterministic.
+                # Bridged in by the earliest depth-(n-1) alert that holds a
+                # frontier entity this one holds too (id breaks ties), so the
+                # choice is deterministic.
                 bridges = sorted(
-                    (a for a in by_depth.get(depth - 1, []) if a.entities() & row.entities()),
+                    (a for a in by_depth.get(depth - 1, []) if a.entities() & row.entities() & frontier),
                     key=lambda a: (a.event_time, str(a.id)),
                 )
                 bridge = bridges[0] if bridges else None
@@ -789,6 +957,19 @@ async def compute_attack_chain(
             next_frontier |= row.entities()
         frontier = next_frontier - seen_entities
 
+    # Evidence strength per alert: the shared entities of each hop (combined so
+    # two independent matches beat one), multiplied along the bridge path.
+    # ``known`` is in discovery order, so a bridge is always settled first.
+    strength: dict[uuid.UUID, float] = {seed.id: 1.0}
+    for alert_id in known:
+        if alert_id == seed.id:
+            continue
+        via_id, shared_set = via_of.get(alert_id, (None, set()))
+        miss = 1.0
+        for kind, value in shared_set:
+            miss *= 1.0 - _entity_weight(kind, value) * _rarity(entity_count[(kind, value)])
+        strength[alert_id] = (1.0 - miss) * (strength.get(via_id, 1.0) if via_id else 1.0)
+
     # Score every non-seed candidate and assemble the chain.
     chain: list[ChainLink] = []
     for alert_id, (cand, distance) in known.items():
@@ -796,6 +977,7 @@ async def compute_attack_chain(
             continue
         score, dt_s = score_candidate(seed, cand, distance, window)
         via_id, shared_set = via_of.get(alert_id, (None, set()))
+        stage = _stage_index(cand)
         chain.append(
             ChainLink(
                 alert_id=cand.id,
@@ -810,21 +992,34 @@ async def compute_attack_chain(
                 connector_type=cand.connector_type,
                 source_event_ids=list(cand.source_event_ids),
                 via_alert_id=via_id,
+                strength=strength[alert_id],
+                stage=None if stage == UNMAPPED_STAGE else stage,
+                tactic=_TACTIC_BY_STAGE.get(stage),
             )
         )
 
-    # The cap keeps the best-scoring links; only then is the survivor set put
-    # into attack-stage order (stage, then time, then id for determinism) so
-    # the timeline reads as an intrusion narrative.
-    chain.sort(key=lambda link: (-link.score, link.event_time, str(link.alert_id)))
+    # The cap keeps the links that are both close to the seed and well
+    # evidenced; only then is the survivor set put into attack-stage order
+    # (stage, then time, then id for determinism) so the timeline reads as an
+    # intrusion narrative.
+    chain.sort(key=lambda link: (-(link.score * link.strength), link.event_time, str(link.alert_id)))
     length_truncated = len(chain) > max_length
     chain = chain[:max_length]
     chain.sort(key=lambda link: (_stage_index(candidate_index[link.alert_id]), link.event_time, str(link.alert_id)))
 
-    # Confidence: best candidate score (the seed is not in ``chain``). The
-    # chain is stage-ordered, so it is the max, not the first element. Score
-    # weights sum to 1 so no normalisation is needed; empty chain -> 0.
-    confidence = max((link.score for link in chain), default=0.0)
+    # Where the stage narrative contradicts the clock, say so.
+    latest: datetime | None = None
+    for link in chain:
+        if link.stage is None:
+            continue
+        if latest is not None and link.event_time < latest:
+            link.out_of_sequence = True
+        latest = link.event_time if latest is None else max(latest, link.event_time)
+
+    # Confidence: how strong the evidence is across the whole chain — the mean
+    # link strength, so one solid link among many weak ones does not make a
+    # confident chain. Not a calibrated probability. Empty chain -> 0.
+    confidence = sum(link.strength for link in chain) / len(chain) if chain else 0.0
     signature = _chain_signature(seed.id, chain)
     entity_graph = _entity_graph_payload(seed, chain, candidate_index)
 
@@ -836,6 +1031,7 @@ async def compute_attack_chain(
         entity_graph=entity_graph,
         chain_signature=signature,
         confidence=confidence,
+        suppressed_pivots=sorted(suppressed.values(), key=lambda d: (d["kind"], d["value"])),
         truncated=sweep_truncated or length_truncated,
         truncated_reasons=[reason for reason, hit in (("sweep_limit", sweep_truncated), ("max_length", length_truncated)) if hit],
     )
@@ -877,7 +1073,7 @@ class PostgresAttackChainLoader:
         limit: int,
         anchor: datetime,
     ) -> list[CandidateAlert]:
-        from sqlalchemy import and_, func, or_, select, text
+        from sqlalchemy import and_, func, or_, select
 
         from app.models.alert import Alert
 
@@ -892,21 +1088,19 @@ class PostgresAttackChainLoader:
             elif kind == "Resource":
                 assets.append(value)
 
-        # JSONB overlap probes. Use the ``?|`` operator so an alert
-        # matches if *any* element in the JSONB array intersects the
-        # candidate list — single index lookup, no UNNEST.
+        # Case-insensitive probes; see ``_any_element_matches``.
         clauses = []
         if users:
-            clauses.append(text("alerts.affected_users ?| :u").bindparams(u=users))
+            clauses.append(_any_element_matches("affected_users", "u", users))
         if hosts:
             clauses.append(
                 or_(
-                    text("alerts.affected_hosts ?| :h").bindparams(h=hosts),
-                    text("alerts.affected_ips ?| :h2").bindparams(h2=hosts),
+                    _any_element_matches("affected_hosts", "h", hosts),
+                    _any_element_matches("affected_ips", "h2", hosts),
                 )
             )
         if assets:
-            clauses.append(text("alerts.affected_assets ?| :a").bindparams(a=assets))
+            clauses.append(_any_element_matches("affected_assets", "a", assets))
 
         if not clauses:
             return []
@@ -933,6 +1127,29 @@ class PostgresAttackChainLoader:
         result = await self._db.execute(stmt)
         rows = result.scalars().all()
         return [_row_to_candidate(row) for row in rows]
+
+
+def _any_element_matches(column: str, param: str, values: list[str]) -> Any:
+    """SQL predicate: some element of the JSONB array ``alerts.<column>`` equals
+    one of ``values``, ignoring case. ``column`` and ``param`` are module
+    constants, never caller input; ``values`` is bound.
+
+    Stored values are whatever each connector wrote, so the column is
+    lower-cased before the ``?|`` probe, and the probes are lower-cased by the
+    database too, so the two sides cannot disagree about case whatever the
+    database's locale. Written as ``lower(col::text)::jsonb ?| ...`` rather
+    than by unnesting the array: the same match measured ~15x slower
+    unindexed on a 30-day window, and this form is what an expression GIN
+    index on ``lower(col::text)::jsonb`` would serve. Matching is
+    case-insensitive but not whitespace-insensitive: a stored value with
+    leading or trailing spaces will not match its trimmed spelling. A
+    malformed (non-array) column cannot raise here.
+    """
+    from sqlalchemy import ARRAY, String, bindparam, text
+
+    return text(
+        f"lower(alerts.{column}::text)::jsonb ?| (SELECT array_agg(lower(p)) FROM unnest(CAST(:{param} AS text[])) AS p)"
+    ).bindparams(bindparam(param, value=values, type_=ARRAY(String)))
 
 
 def _row_to_candidate(row: Any) -> CandidateAlert:

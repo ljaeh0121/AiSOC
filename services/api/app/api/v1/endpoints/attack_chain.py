@@ -132,6 +132,7 @@ async def get_attack_chain(
             "confidence": 0.0,
             "truncated": False,
             "truncated_reasons": [],
+            "suppressed_pivots": [],
             "reason": "case_has_no_linked_alerts",
         }
 

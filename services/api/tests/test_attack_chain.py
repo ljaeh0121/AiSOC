@@ -580,14 +580,15 @@ def test_truncation_keeps_highest_scoring_links_not_earliest_stage() -> None:
     assert unmapped.id in {link.alert_id for link in chain.chain}  # highest score overall
 
 
-def test_confidence_excludes_seed() -> None:
-    unmapped = _unmapped_alert()
-    chain = _run([*_build_lockbit_chain(), unmapped])
-    assert chain is not None
-    best = max(link.score for link in chain.chain)
-    assert chain.confidence == pytest.approx(best)
-    assert chain.chain[0].score < best  # best candidate is not first in stage order
-    assert chain.confidence < 1.0  # the seed's implicit 1.0 never leaks in
+def test_confidence_does_not_count_the_seed() -> None:
+    """The seed is not a link in the chain; its implicit full strength must
+    not be averaged in."""
+    seed = _seed(affected_users=("jdoe@acme.test",))
+    only = _mk(1, 5, affected_users=("jdoe@acme.test",))
+    chain = _run([seed, only])
+    assert chain is not None and len(chain.chain) == 1
+    assert chain.confidence == pytest.approx(chain.chain[0].strength)
+    assert chain.confidence < 1.0
 
 
 def test_depth2_link_has_via_alert() -> None:
@@ -703,3 +704,262 @@ def test_both_reasons_can_apply_at_once() -> None:
     chain = _run([_seed_for(others), *others], sweep_limit=4, max_length=2)
     assert chain is not None
     assert chain.truncated_reasons == ["sweep_limit", "max_length"]
+
+
+# ---------------------------------------------------------------------------
+# P1 — entity hygiene, evidence strength, stage fields
+# ---------------------------------------------------------------------------
+
+from app.services.attack_chain import (  # noqa: E402
+    HUB_FANOUT,
+    is_generic_account,
+    normalize_entity,
+)
+
+
+@pytest.mark.parametrize(
+    ("kind", "raw", "expected"),
+    [
+        ("Identity", "  JDoe@Acme.Test ", "jdoe@acme.test"),
+        ("Identity", "CORP\\JDoe", "corp\\jdoe"),
+        ("Endpoint", "WIN-USR-101.", "win-usr-101"),
+        ("Endpoint", "::ffff:203.0.113.42", "203.0.113.42"),
+        ("Endpoint", "2001:0DB8:0:0:0:0:0:1", "2001:db8::1"),
+        ("Endpoint", "[2001:db8::1]", "2001:db8::1"),
+        ("Resource", "S3://Acme-Research/", "s3://acme-research"),
+    ],
+)
+def test_entity_values_are_normalised(kind: str, raw: str, expected: str) -> None:
+    assert normalize_entity(kind, raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("kind", "raw"),
+    [
+        ("Identity", ""),
+        ("Identity", "   "),
+        ("Identity", "-"),
+        ("Identity", "N/A"),
+        ("Identity", "Unknown"),
+        ("Identity", None),
+        ("Endpoint", "localhost"),
+        ("Endpoint", "127.0.0.1"),
+        ("Endpoint", "::1"),
+        ("Endpoint", "0.0.0.0"),
+        ("Endpoint", "169.254.10.5"),
+        ("Endpoint", "224.0.0.251"),
+        ("Endpoint", "255.255.255.255"),
+    ],
+)
+def test_values_that_identify_nothing_are_not_entities(kind: str, raw: object) -> None:
+    assert normalize_entity(kind, raw) is None
+
+
+@pytest.mark.parametrize(
+    ("value", "generic"),
+    [
+        ("SYSTEM", True),
+        ("NT AUTHORITY\\SYSTEM", True),
+        ("CORP\\Administrator", True),
+        ("root", True),
+        ("admin@acme.test", True),
+        ("jdoe@acme.test", False),
+        ("rootkit-analyst", False),
+    ],
+)
+def test_shared_accounts_are_recognised_as_generic(value: str, generic: bool) -> None:
+    assert is_generic_account(value) is generic
+
+
+def _mk(n: int, minutes: int, **kw) -> CandidateAlert:
+    return CandidateAlert(
+        id=uuid.UUID(int=n),
+        tenant_id=TENANT,
+        title=f"alert {n}",
+        severity=kw.pop("severity", "high"),
+        event_time=T0 + timedelta(minutes=minutes),
+        **kw,
+    )
+
+
+def _seed(**kw) -> CandidateAlert:
+    return CandidateAlert(id=SEED_ID, tenant_id=TENANT, title="seed", severity="high", event_time=T0, **kw)
+
+
+def test_alerts_that_differ_only_in_case_are_linked() -> None:
+    seed = _seed(affected_users=("JDoe@Acme.Test",))
+    other = _mk(1, 5, affected_users=("jdoe@acme.test",))
+    chain = _run([seed, other])
+    assert chain is not None
+    assert [link.alert_id for link in chain.chain] == [other.id]
+    assert chain.chain[0].shared_entities == [{"kind": "Identity", "value": "jdoe@acme.test"}]
+
+
+def test_a_generic_account_is_never_a_pivot() -> None:
+    seed = _seed(affected_users=("NT AUTHORITY\\SYSTEM",), affected_hosts=("h1",))
+    unrelated = _mk(1, 5, affected_users=("NT AUTHORITY\\SYSTEM",), affected_hosts=("h2",))
+    related = _mk(2, 6, affected_hosts=("h1",))
+    loader = _RecordingLoader([seed, unrelated, related])
+    chain = _run([], loader)
+    assert chain is not None
+    assert [link.alert_id for link in chain.chain] == [related.id]
+    assert ("Identity", "nt authority\\system") not in {e for call in loader.calls for e in call}
+    assert chain.suppressed_pivots == [
+        {"kind": "Identity", "value": "nt authority\\system", "reason": "generic_account", "alert_count": None}
+    ]
+
+
+def test_an_entity_reached_through_a_hub_is_not_expanded() -> None:
+    """A shared egress IP that dozens of unrelated alerts touch must not drag
+    them all into the chain just because one related alert also touched it."""
+    seed = _seed(affected_hosts=("h1",))
+    bridge = _mk(1, 5, affected_hosts=("h1",), affected_ips=("198.51.100.9",))
+    noise = [_mk(100 + i, 10 + i, affected_ips=("198.51.100.9",)) for i in range(HUB_FANOUT + 5)]
+    chain = _run([seed, bridge, *noise])
+    assert chain is not None
+    assert [link.alert_id for link in chain.chain] == [bridge.id]
+    assert chain.suppressed_pivots == [
+        {"kind": "Endpoint", "value": "198.51.100.9", "reason": "high_fanout", "alert_count": HUB_FANOUT + 5}
+    ]
+
+
+def test_a_busy_entity_on_the_seed_itself_is_still_followed() -> None:
+    """The seed's own entities are the case's anchor: a compromised account
+    legitimately has many alerts. Dense is weak evidence there, not excluded."""
+    seed = _seed(affected_users=("jdoe@acme.test",))
+    many = [_mk(i + 1, i + 1, affected_users=("jdoe@acme.test",)) for i in range(HUB_FANOUT + 5)]
+    chain = _run([seed, *many])
+    assert chain is not None
+    assert len(chain.chain) == HUB_FANOUT + 5
+    assert chain.suppressed_pivots == []
+
+
+def test_link_strength_is_the_weight_of_what_was_shared() -> None:
+    seed = _seed(affected_users=("jdoe@acme.test",), affected_hosts=("h1",), affected_ips=("203.0.113.5",))
+    by_user = _mk(1, 5, affected_users=("jdoe@acme.test",))
+    by_ip = _mk(2, 6, affected_ips=("203.0.113.5",))
+    by_both = _mk(3, 7, affected_users=("jdoe@acme.test",), affected_hosts=("h1",))
+    chain = _run([seed, by_user, by_ip, by_both])
+    assert chain is not None
+    s = {link.alert_id: link.strength for link in chain.chain}
+    assert s[by_ip.id] < s[by_user.id] < s[by_both.id] <= 1.0
+    assert all(0.0 < v <= 1.0 for v in s.values())
+
+
+def test_a_link_through_a_busy_entity_is_weaker_than_one_through_a_rare_entity() -> None:
+    def strength_with(extra: int) -> float:
+        seed = _seed(affected_users=("jdoe@acme.test",))
+        peers = [_mk(i + 1, i + 1, affected_users=("jdoe@acme.test",)) for i in range(1 + extra)]
+        chain = _run([seed, *peers])
+        assert chain is not None
+        return next(link.strength for link in chain.chain if link.alert_id == peers[0].id)
+
+    assert strength_with(8) < strength_with(0)
+
+
+def test_a_two_hop_link_is_no_stronger_than_the_hop_that_reached_it() -> None:
+    chain = _run(_build_lockbit_chain())
+    assert chain is not None
+    by_id = {link.alert_id: link for link in chain.chain}
+    for deep in (A4_ID, A5_ID):
+        assert by_id[deep].strength < by_id[by_id[deep].via_alert_id].strength
+
+
+def test_chain_confidence_is_the_mean_link_strength_not_the_best_link() -> None:
+    chain = _run(_build_lockbit_chain())
+    assert chain is not None
+    assert chain.confidence == pytest.approx(sum(link.strength for link in chain.chain) / len(chain.chain))
+
+
+def test_a_chain_padded_with_weak_links_is_less_confident() -> None:
+    seed = _seed(affected_users=("jdoe@acme.test",), affected_hosts=("h1",))
+    strong = _mk(1, 5, affected_users=("jdoe@acme.test",), affected_hosts=("h1",))
+    lone = _run([seed, strong])
+    # weak links: reached only through an address one other alert shares
+    pad_bridge = _mk(2, 6, affected_hosts=("h1",), affected_ips=("203.0.113.77",))
+    pad = [_mk(20 + i, 20 + i, affected_ips=("203.0.113.77",)) for i in range(5)]
+    padded = _run([seed, strong, pad_bridge, *pad])
+    assert lone is not None and padded is not None
+    assert padded.confidence < lone.confidence
+
+
+def test_an_empty_chain_has_zero_confidence() -> None:
+    chain = _run([_seed(affected_users=("jdoe@acme.test",))])
+    assert chain is not None
+    assert chain.chain == []
+    assert chain.confidence == 0.0
+
+
+def test_links_carry_their_stage_and_tactic() -> None:
+    unmapped = _unmapped_alert()
+    chain = _run([*_build_lockbit_chain(), unmapped])
+    assert chain is not None
+    by_id = {link.alert_id: link for link in chain.chain}
+    assert (by_id[A2_ID].stage, by_id[A2_ID].tactic) == (2, "initial-access")
+    assert (by_id[A4_ID].stage, by_id[A4_ID].tactic) == (8, "discovery")
+    assert (by_id[unmapped.id].stage, by_id[unmapped.id].tactic) == (None, None)
+    d = by_id[A5_ID].to_dict()
+    assert {"stage", "tactic", "strength", "out_of_sequence"} <= d.keys()
+
+
+def test_a_chain_whose_stage_order_contradicts_time_is_marked() -> None:
+    seed = _seed(affected_users=("jdoe@acme.test",), mitre_techniques=("T1566",))
+    exfil_first = _mk(1, 10, affected_users=("jdoe@acme.test",), mitre_techniques=("T1567",))
+    discovery_later = _mk(2, 60, affected_users=("jdoe@acme.test",), mitre_techniques=("T1083",))
+    chain = _run([seed, exfil_first, discovery_later])
+    assert chain is not None
+    assert [link.alert_id for link in chain.chain] == [discovery_later.id, exfil_first.id]  # stage order
+    flags = {link.alert_id: link.out_of_sequence for link in chain.chain}
+    assert flags == {discovery_later.id: False, exfil_first.id: True}
+
+
+def test_a_chain_that_reads_forward_in_time_is_not_marked() -> None:
+    chain = _run(_build_lockbit_chain())
+    assert chain is not None
+    assert not any(link.out_of_sequence for link in chain.chain)
+
+
+# ---------------------------------------------------------------------------
+# Contract with the console
+# ---------------------------------------------------------------------------
+
+import dataclasses  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+CONTRACT_FIXTURE = Path(__file__).parent / "fixtures" / "attack_chain_response.json"
+CASE_ID = uuid.UUID(int=0xCA5E)
+
+
+def _contract_payload() -> dict:
+    """The exact body ``GET /cases/{id}/attack-chain`` returns for the LockBit
+    scenario, on fixed ids so the file is byte-stable."""
+    fixed = {a.id: uuid.UUID(int=0x1000 + i) for i, a in enumerate(_build_lockbit_chain())}
+    alerts = [dataclasses.replace(a, id=fixed[a.id]) for a in _build_lockbit_chain()]
+    chain = asyncio.run(
+        compute_attack_chain(
+            seed_alert_id=fixed[SEED_ID],
+            tenant_id=TENANT,
+            loader=_InMemoryLoader(alerts),
+            window=DEFAULT_WINDOW,
+            window_label="24h",
+            now=T0,
+        )
+    )
+    assert chain is not None
+    payload = chain.to_dict()
+    payload.pop("generated_at")  # a clock reading; the console falls back when absent
+    payload["case_id"] = str(CASE_ID)
+    return json.loads(json.dumps(payload, sort_keys=True))
+
+
+def test_response_body_matches_the_fixture_the_console_is_tested_against() -> None:
+    """``apps/web`` feeds this same file through ``casesApi.getAttackChain``.
+    If the response changes shape this fails until the file is regenerated
+    (``ATTACK_CHAIN_UPDATE_FIXTURE=1``), which in turn fails the console's
+    test unless its mapper learned the change."""
+    payload = _contract_payload()
+    if os.environ.get("ATTACK_CHAIN_UPDATE_FIXTURE"):
+        CONTRACT_FIXTURE.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    assert json.loads(CONTRACT_FIXTURE.read_text()) == payload

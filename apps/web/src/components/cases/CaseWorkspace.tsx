@@ -26,6 +26,7 @@ import { format, formatDistanceToNow } from "date-fns";
 import toast from "react-hot-toast";
 import {
   apiFetch,
+  type AttackChainSuppressedPivot,
   type AttackChainTimeline,
   type AttackChainWindow,
   type Case,
@@ -1541,15 +1542,15 @@ function AttackPathPanel({ caseId }: { caseId: string }) {
 
 // ─── Attack chain panel ───────────────────────────────────────────────────────
 //
-// Renders the ranked temporal timeline of related alerts (the "attack chain")
-// computed by services/api/app/services/attack_chain.py. The backend's BFS
-// expands from the seed alert through the case's linked alerts, ranks each
-// link by recency + shared-entity overlap + MITRE tactic co-occurrence, and
-// hands us back a deterministic timeline plus the entity graph that connects
-// the alerts. We render this as a vertical timeline (most-recent first by
-// distance) with severity bands, score, and the entities each step shares
-// with its predecessor — that's the part an analyst actually reads to decide
-// "yes, this is one campaign, not three independent things."
+// Renders the alerts related to the case's seed alert (the "attack chain")
+// computed by services/api/app/services/attack_chain.py. The backend walks the
+// alert<->entity graph outward from the seed (users, hosts, addresses,
+// resources the alerts have in common), scores how strongly each alert is tied
+// to the seed, and returns them in ATT&CK stage order, then time. The seed is
+// NOT one of the returned links; it is named separately from the entity graph.
+// What the analyst reads here is *why* each alert is in the list (shared
+// entities, the alert that bridged it in, how strong that evidence is) and
+// whether the list is complete.
 
 const CHAIN_SEVERITY_STYLES: Record<string, string> = {
   critical: "bg-rose-500/15 text-rose-300 ring-rose-500/30",
@@ -1586,6 +1587,30 @@ function isAttackChainWindow(value: string | null | undefined): value is AttackC
 // on first paint; analysts who want a tighter view narrow with the
 // selector, and the choice is persisted on the URL via `?window=…`.
 const DEFAULT_CHAIN_WINDOW: AttackChainWindow = "24h";
+
+const CHAIN_TRUNCATION_REASONS: Record<string, string> = {
+  sweep_limit: "an entity search hit its row limit, so some related alerts were never read",
+  max_length: "the chain was cut to its length cap",
+};
+
+function suppressedPivotText(pivot: AttackChainSuppressedPivot): string {
+  if (pivot.reason === "generic_account") return "shared account";
+  if (pivot.reason === "high_fanout") {
+    return pivot.alertCount != null
+      ? `touched by at least ${pivot.alertCount} alerts`
+      : "touched by many alerts";
+  }
+  return pivot.reason;
+}
+
+/** Absolute distance from the seed, e.g. `±5m from seed`. */
+function formatSeedDistance(seconds: number): string {
+  const s = Math.max(0, seconds);
+  if (s < 60) return `±${Math.round(s)}s from seed`;
+  const minutes = Math.round(s / 60);
+  if (minutes < 60) return `±${minutes}m from seed`;
+  return `±${(minutes / 60).toFixed(1)}h from seed`;
+}
 
 function AttackChainPanel({ caseId }: { caseId: string }) {
   // Mirror AttackPathPanel's guard: caseId can be empty during the brief window
@@ -1682,8 +1707,9 @@ function AttackChainPanel({ caseId }: { caseId: string }) {
           </div>
           <p className="text-sm font-medium text-slate-300">No attack chain yet</p>
           <p className="mt-1 max-w-md text-xs text-slate-500">
-            An attack chain forms once two or more alerts in the {windowParam} window share entities
-            or MITRE techniques. Link more alerts to the case or widen the window.
+            A chain forms when other alerts in the {windowParam} window share an entity (a user, host,
+            address or resource) with the case&apos;s first alert. Link more alerts to the case or widen
+            the window.
           </p>
         </div>
       </div>
@@ -1704,6 +1730,14 @@ function AttackChainPanel({ caseId }: { caseId: string }) {
 
   const nodeCount = data.entityGraph.nodes.length;
   const edgeCount = data.entityGraph.edges.length;
+
+  // Alert titles by id: the chain has every link's, the entity graph also has
+  // the seed's and any bridging alert the length cap dropped from the chain.
+  const titleOfAlert = (alertId: string): string =>
+    data.chain.find((l) => l.alertId === alertId)?.title ??
+    data.entityGraph.nodes.find((n) => n.id === `alert:${alertId}`)?.label ??
+    `alert ${alertId.slice(0, 8)}`;
+  const seedTitle = titleOfAlert(data.seedAlertId);
 
   return (
     <div className="space-y-4">
@@ -1727,7 +1761,7 @@ function AttackChainPanel({ caseId }: { caseId: string }) {
               "inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium ring-1",
               confidenceClass
             )}
-            title="Confidence is derived from average link score and chain length"
+            title="Mean evidence strength of the links — not a calibrated probability"
           >
             confidence {confidencePct}%
           </span>
@@ -1735,30 +1769,58 @@ function AttackChainPanel({ caseId }: { caseId: string }) {
         </div>
       </div>
 
-      {/* Vertical timeline. Steps are already sorted by event_time on the
-          backend (oldest → newest); we render in that order so the analyst
-          reads the chain the same way the campaign actually unfolded. */}
+      {/* The seed is not one of the links: name it from the entity graph. */}
+      <div
+        data-testid="chain-seed"
+        className="rounded-xl border border-rose-500/30 bg-rose-500/5 px-4 py-2.5"
+      >
+        <span className="text-[10px] font-semibold uppercase tracking-wide text-rose-300">
+          Seed alert
+        </span>
+        <p className="mt-0.5 text-sm text-slate-200 truncate" title={seedTitle}>
+          {seedTitle}
+        </p>
+      </div>
+
+      {data.truncated === true && (
+        <div
+          data-testid="chain-truncated"
+          role="status"
+          className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-2.5 text-xs text-amber-200"
+        >
+          <p className="font-medium">This chain is incomplete.</p>
+          <p className="mt-0.5 text-amber-200/80">
+            {data.truncatedReasons.map((r) => CHAIN_TRUNCATION_REASONS[r] ?? r).join("; ")}. A short
+            chain here does not mean nothing else is related.
+          </p>
+        </div>
+      )}
+      {data.truncated === null && (
+        <p data-testid="chain-completeness-unknown" className="text-[11px] text-slate-500">
+          This server did not report whether the chain is complete.
+        </p>
+      )}
+      {data.suppressedPivots.length > 0 && (
+        <p data-testid="chain-suppressed" className="text-[11px] text-slate-500">
+          Not followed:{" "}
+          {data.suppressedPivots
+            .map((p) => `${p.value} (${suppressedPivotText(p)})`)
+            .join(", ")}
+          . Alerts reachable only through these are not shown.
+        </p>
+      )}
+
+      {/* Vertical timeline in ATT&CK stage order, then time. This is an attack
+          narrative, not a clock: a link that happened earlier than one before
+          it is flagged "out of sequence". */}
       <ol className="relative space-y-3 border-l border-slate-800/60 pl-5">
-        {data.chain.map((link, index) => {
+        {data.chain.map((link) => {
           const sevClass = severityChipClass(link.severity);
-          const isFirst = index === 0;
-          const dtMinutes = Math.round(link.dtSeconds / 60);
-          const dtLabel = isFirst
-            ? "seed"
-            : dtMinutes <= 0
-              ? `+${Math.max(1, Math.round(link.dtSeconds))}s`
-              : dtMinutes < 60
-                ? `+${dtMinutes}m`
-                : `+${(dtMinutes / 60).toFixed(1)}h`;
+          const viaTitle = link.viaAlertId ? titleOfAlert(link.viaAlertId) : null;
           return (
-            <li key={link.alertId} className="relative">
+            <li key={link.alertId} data-testid={`chain-link-${link.alertId}`} className="relative">
               {/* Dot anchored to the spine */}
-              <span
-                className={clsx(
-                  "absolute -left-[26px] top-2 inline-block h-2.5 w-2.5 rounded-full ring-2 ring-slate-950",
-                  isFirst ? "bg-rose-400" : "bg-slate-500"
-                )}
-              />
+              <span className="absolute -left-[26px] top-2 inline-block h-2.5 w-2.5 rounded-full bg-slate-500 ring-2 ring-slate-950" />
               <div className="rounded-xl border border-slate-800/80 bg-slate-900/40 p-4">
                 <div className="flex flex-wrap items-start justify-between gap-2">
                   <div className="min-w-0">
@@ -1771,9 +1833,23 @@ function AttackChainPanel({ caseId }: { caseId: string }) {
                       >
                         {link.severity}
                       </span>
-                      {isFirst && (
-                        <span className="inline-flex items-center rounded-full bg-rose-500/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-rose-300 ring-1 ring-rose-500/30">
-                          seed
+                      <span
+                        className={clsx(
+                          "inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium capitalize ring-1",
+                          link.tactic
+                            ? "bg-indigo-500/10 text-indigo-300 ring-indigo-500/30"
+                            : "bg-slate-800 text-slate-500 ring-slate-700/60"
+                        )}
+                        title="ATT&CK tactic of the earliest-stage technique on this alert"
+                      >
+                        {link.tactic ? link.tactic.replace(/-/g, " ") : "no tactic"}
+                      </span>
+                      {link.outOfSequence && (
+                        <span
+                          className="inline-flex items-center rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-300 ring-1 ring-amber-500/30"
+                          title="This alert happened earlier than a link before it in attack-stage order: the stage story and the clock disagree."
+                        >
+                          out of sequence
                         </span>
                       )}
                       {link.connectorType && (
@@ -1783,9 +1859,9 @@ function AttackChainPanel({ caseId }: { caseId: string }) {
                       )}
                       <span
                         className="text-[10px] font-mono text-slate-500"
-                        title="time since previous link"
+                        title="Time distance from the seed alert (not from the previous link)"
                       >
-                        Δt {dtLabel}
+                        {formatSeedDistance(link.dtSeconds)}
                       </span>
                     </div>
                     <p
@@ -1803,25 +1879,40 @@ function AttackChainPanel({ caseId }: { caseId: string }) {
                         }
                       })()}
                     </p>
+                    {viaTitle && (
+                      <p className="mt-0.5 text-[11px] text-slate-500" title="The alert that connected this one to the chain">
+                        via {viaTitle}
+                      </p>
+                    )}
                   </div>
                   <div className="flex shrink-0 flex-col items-end gap-1">
-                    <span className="rounded-md bg-slate-800/60 px-2 py-0.5 text-[10px] font-mono text-slate-300 ring-1 ring-slate-700/60">
-                      score {link.score.toFixed(2)}
+                    <span
+                      className="rounded-md bg-slate-800/60 px-2 py-0.5 text-[10px] font-mono text-slate-300 ring-1 ring-slate-700/60"
+                      title="Strength of the evidence tying this alert to the seed: what was shared, how rare it is, multiplied along each hop"
+                    >
+                      {link.strength != null
+                        ? `evidence ${Math.round(link.strength * 100)}%`
+                        : "evidence n/a"}
                     </span>
-                    <span className="text-[10px] text-slate-600">distance {link.distance}</span>
+                    <span
+                      className="text-[10px] text-slate-600"
+                      title="Proximity/relevance to the seed: graph distance, time, risk overlap"
+                    >
+                      score {link.score.toFixed(2)} · {link.distance} hop{link.distance === 1 ? "" : "s"}
+                    </span>
                   </div>
                 </div>
 
                 {/* Shared entities — the "why is this link in the chain"
-                    explanation. Empty for the seed because there's no
-                    predecessor to share with. */}
+                    explanation: shared with the seed for a one-hop link, with
+                    the bridging alert for a deeper one. */}
                 {link.sharedEntities.length > 0 && (
                   <div className="mt-3 flex flex-wrap gap-1.5">
                     {link.sharedEntities.slice(0, 6).map((entity, i) => (
                       <span
                         key={`${entity.kind ?? "entity"}-${entity.value ?? i}`}
                         className="inline-flex items-center gap-1 rounded bg-slate-800/70 px-1.5 py-0.5 text-[10px] font-mono text-slate-300 ring-1 ring-slate-700/60"
-                        title={`Shared with previous link: ${entity.kind ?? ""}`}
+                        title={`Shared with ${viaTitle ? "the bridging alert" : "the seed"}: ${entity.kind ?? ""}`}
                       >
                         <span className="text-slate-500">{entity.kind}</span>
                         <span>{entity.value}</span>

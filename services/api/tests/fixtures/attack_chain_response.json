@@ -1,0 +1,243 @@
+{
+  "case_id": "00000000-0000-0000-0000-00000000ca5e",
+  "chain": [
+    {
+      "alert_id": "00000000-0000-0000-0000-000000001001",
+      "connector_type": "email_security",
+      "distance": 1,
+      "dt_seconds": 300.0,
+      "event_time": "2026-05-14T08:05:00",
+      "mitre_techniques": [
+        "T1566.002",
+        "T1078"
+      ],
+      "out_of_sequence": false,
+      "score": 0.894,
+      "severity": "high",
+      "shared_entities": [
+        {
+          "kind": "Endpoint",
+          "value": "win-usr-101"
+        },
+        {
+          "kind": "Identity",
+          "value": "jdoe@acme.test"
+        }
+      ],
+      "source_event_ids": [
+        "evt-cred-002"
+      ],
+      "stage": 2,
+      "strength": 0.9568,
+      "tactic": "initial-access",
+      "title": "Credential harvesting via fake O365 login portal",
+      "via_alert_id": null
+    },
+    {
+      "alert_id": "00000000-0000-0000-0000-000000001002",
+      "connector_type": "aws_cloudtrail",
+      "distance": 1,
+      "dt_seconds": 7200.0,
+      "event_time": "2026-05-14T10:00:00",
+      "mitre_techniques": [
+        "T1078.004"
+      ],
+      "out_of_sequence": false,
+      "score": 0.87,
+      "severity": "high",
+      "shared_entities": [
+        {
+          "kind": "Identity",
+          "value": "jdoe@acme.test"
+        }
+      ],
+      "source_event_ids": [
+        "evt-auth-003"
+      ],
+      "stage": 2,
+      "strength": 0.5678,
+      "tactic": "initial-access",
+      "title": "Cloud auth anomaly: impossible-travel sign-in to AWS console",
+      "via_alert_id": null
+    },
+    {
+      "alert_id": "00000000-0000-0000-0000-000000001003",
+      "connector_type": "aws_cloudtrail",
+      "distance": 2,
+      "dt_seconds": 21600.0,
+      "event_time": "2026-05-14T14:00:00",
+      "mitre_techniques": [
+        "T1580",
+        "T1530"
+      ],
+      "out_of_sequence": false,
+      "score": 0.545,
+      "severity": "medium",
+      "shared_entities": [
+        {
+          "kind": "Endpoint",
+          "value": "203.0.113.42"
+        },
+        {
+          "kind": "Resource",
+          "value": "s3://acme-research"
+        }
+      ],
+      "source_event_ids": [
+        "evt-enum-004"
+      ],
+      "stage": 8,
+      "strength": 0.4272,
+      "tactic": "discovery",
+      "title": "S3 bucket enumeration from unusual ASN",
+      "via_alert_id": "00000000-0000-0000-0000-000000001002"
+    },
+    {
+      "alert_id": "00000000-0000-0000-0000-000000001004",
+      "connector_type": "aws_cloudtrail",
+      "distance": 2,
+      "dt_seconds": 28800.0,
+      "event_time": "2026-05-14T16:00:00",
+      "mitre_techniques": [
+        "T1530",
+        "T1567.002"
+      ],
+      "out_of_sequence": false,
+      "score": 0.52,
+      "severity": "critical",
+      "shared_entities": [
+        {
+          "kind": "Resource",
+          "value": "s3://acme-research"
+        }
+      ],
+      "source_event_ids": [
+        "evt-exfil-005"
+      ],
+      "stage": 10,
+      "strength": 0.2866,
+      "tactic": "collection",
+      "title": "Large outbound data egress from S3 to unknown destination",
+      "via_alert_id": "00000000-0000-0000-0000-000000001002"
+    }
+  ],
+  "chain_signature": "7b06272393accbd1e79d55f0a9a19ff9",
+  "confidence": 0.5596,
+  "entity_graph": {
+    "edges": [
+      {
+        "kind": "TOUCHES",
+        "source": "alert:00000000-0000-0000-0000-000000001000",
+        "target": "endpoint:win-usr-101"
+      },
+      {
+        "kind": "TOUCHES",
+        "source": "alert:00000000-0000-0000-0000-000000001000",
+        "target": "identity:jdoe@acme.test"
+      },
+      {
+        "kind": "TOUCHES",
+        "source": "alert:00000000-0000-0000-0000-000000001001",
+        "target": "endpoint:win-usr-101"
+      },
+      {
+        "kind": "TOUCHES",
+        "source": "alert:00000000-0000-0000-0000-000000001001",
+        "target": "identity:jdoe@acme.test"
+      },
+      {
+        "kind": "TOUCHES",
+        "source": "alert:00000000-0000-0000-0000-000000001002",
+        "target": "identity:jdoe@acme.test"
+      },
+      {
+        "kind": "TOUCHES",
+        "source": "alert:00000000-0000-0000-0000-000000001003",
+        "target": "endpoint:203.0.113.42"
+      },
+      {
+        "kind": "TOUCHES",
+        "source": "alert:00000000-0000-0000-0000-000000001002",
+        "target": "endpoint:203.0.113.42"
+      },
+      {
+        "kind": "TOUCHES",
+        "source": "alert:00000000-0000-0000-0000-000000001003",
+        "target": "resource:s3://acme-research"
+      },
+      {
+        "kind": "TOUCHES",
+        "source": "alert:00000000-0000-0000-0000-000000001002",
+        "target": "resource:s3://acme-research"
+      },
+      {
+        "kind": "TOUCHES",
+        "source": "alert:00000000-0000-0000-0000-000000001004",
+        "target": "resource:s3://acme-research"
+      }
+    ],
+    "nodes": [
+      {
+        "event_time": "2026-05-14T08:00:00",
+        "id": "alert:00000000-0000-0000-0000-000000001000",
+        "kind": "Alert",
+        "label": "Phishing email with malicious attachment delivered",
+        "severity": "medium"
+      },
+      {
+        "id": "endpoint:win-usr-101",
+        "kind": "Endpoint",
+        "label": "win-usr-101"
+      },
+      {
+        "id": "identity:jdoe@acme.test",
+        "kind": "Identity",
+        "label": "jdoe@acme.test"
+      },
+      {
+        "event_time": "2026-05-14T08:05:00",
+        "id": "alert:00000000-0000-0000-0000-000000001001",
+        "kind": "Alert",
+        "label": "Credential harvesting via fake O365 login portal",
+        "severity": "high"
+      },
+      {
+        "event_time": "2026-05-14T10:00:00",
+        "id": "alert:00000000-0000-0000-0000-000000001002",
+        "kind": "Alert",
+        "label": "Cloud auth anomaly: impossible-travel sign-in to AWS console",
+        "severity": "high"
+      },
+      {
+        "event_time": "2026-05-14T14:00:00",
+        "id": "alert:00000000-0000-0000-0000-000000001003",
+        "kind": "Alert",
+        "label": "S3 bucket enumeration from unusual ASN",
+        "severity": "medium"
+      },
+      {
+        "id": "endpoint:203.0.113.42",
+        "kind": "Endpoint",
+        "label": "203.0.113.42"
+      },
+      {
+        "id": "resource:s3://acme-research",
+        "kind": "Resource",
+        "label": "s3://acme-research"
+      },
+      {
+        "event_time": "2026-05-14T16:00:00",
+        "id": "alert:00000000-0000-0000-0000-000000001004",
+        "kind": "Alert",
+        "label": "Large outbound data egress from S3 to unknown destination",
+        "severity": "critical"
+      }
+    ]
+  },
+  "seed_alert_id": "00000000-0000-0000-0000-000000001000",
+  "suppressed_pivots": [],
+  "tenant_id": "00000000-0000-0000-0000-000000000777",
+  "truncated": false,
+  "truncated_reasons": [],
+  "window": "24h"
+}

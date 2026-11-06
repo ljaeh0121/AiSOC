@@ -2759,8 +2759,9 @@ export const casesApi = {
    * Attack-chain timeline visualization (T3.3 — v8.0).
    *
    * Backed by `/api/v1/cases/{id}/attack-chain` which runs a graph BFS over
-   * the case's seed alert and returns a ranked, time-ordered chain of
-   * related alerts plus a side-by-side entity graph. Severity stays as a
+   * the case's seed alert and returns the related alerts in ATT&CK stage
+   * order (then time) plus a side-by-side entity graph. The seed is not a
+   * member of the chain. Severity stays as a
    * lowercase string (info|low|medium|high|critical) to round-trip the
    * five-tier ladder cleanly.
    *
@@ -2786,6 +2787,15 @@ export const casesApi = {
       seedAlertId: raw.seed_alert_id,
       chainSignature: raw.chain_signature ?? null,
       confidence: typeof raw.confidence === "number" ? raw.confidence : 0,
+      // `null` means the server did not say; that must not read as "complete".
+      truncated: typeof raw.truncated === "boolean" ? raw.truncated : null,
+      truncatedReasons: raw.truncated_reasons ?? [],
+      suppressedPivots: (raw.suppressed_pivots ?? []).map((p) => ({
+        kind: p.kind,
+        value: p.value,
+        reason: p.reason,
+        alertCount: p.alert_count ?? null,
+      })),
       generatedAt: raw.generated_at ?? new Date().toISOString(),
       chain: (raw.chain ?? []).map((link) => ({
         alertId: link.alert_id,
@@ -2799,6 +2809,11 @@ export const casesApi = {
         mitreTechniques: link.mitre_techniques ?? [],
         connectorType: link.connector_type ?? null,
         sourceEventIds: link.source_event_ids ?? [],
+        viaAlertId: link.via_alert_id ?? null,
+        strength: typeof link.strength === "number" ? link.strength : null,
+        stage: typeof link.stage === "number" ? link.stage : null,
+        tactic: link.tactic ?? null,
+        outOfSequence: link.out_of_sequence ?? false,
       })),
       entityGraph: {
         nodes: raw.entity_graph?.nodes ?? [],
@@ -5058,8 +5073,9 @@ interface BackendCaseAttackPathResponse {
 }
 
 // ─── Attack chain timeline (T3.3 — v8.0) ──────────────────────────────────────
-// The attack-chain endpoint returns a ranked, time-ordered chain of related
-// alerts starting from the seed alert anchored to a case. It's distinct from
+// The attack-chain endpoint returns the alerts related to the seed alert
+// anchored to a case, in ATT&CK stage order (then time). The seed itself is
+// not in the chain. It's distinct from
 // the case attack-path graph above: this view is *temporal* (a timeline of
 // alerts) while the path view is *topological* (a graph of entities). Both
 // power different tabs in the case workspace.
@@ -5080,19 +5096,37 @@ export interface AttackChainLink {
   alertId: string;
   title: string;
   severity: AttackChainSeverity | string;
-  /** ISO-8601. The chain is ordered by this field. */
+  /** ISO-8601 time of the alert. The chain is NOT ordered by this field. */
   eventTime: string;
-  /** Ranking score the BFS uses to pick the top chain candidates. */
+  /** Proximity/relevance to the seed (graph distance, time, risk overlap). */
   score: number;
-  /** Hops from the seed alert in the entity graph. 0 == seed itself. */
+  /** Hops from the seed alert in the entity graph; always >= 1. */
   distance: number;
-  /** Time gap from the previous link, in seconds. Always >= 0. */
+  /** Absolute time distance from the seed alert, in seconds. Always >= 0. */
   dtSeconds: number;
-  /** Entities that bridge this link to the rest of the chain. */
+  /** Entities shared with the seed (distance 1) or with `viaAlertId`. */
   sharedEntities: Array<{ kind: string; value: string }>;
   mitreTechniques: string[];
   connectorType: string | null;
   sourceEventIds: string[];
+  /** The alert that bridged this one in; null when it touches the seed. */
+  viaAlertId: string | null;
+  /** 0..1 strength of the evidence tying this alert to the seed; null if unreported. */
+  strength: number | null;
+  /** ATT&CK kill-chain stage index and tactic; null when no technique maps. */
+  stage: number | null;
+  tactic: string | null;
+  /** Happened earlier than a link before it in stage order. */
+  outOfSequence: boolean;
+}
+
+/** An entity the traversal declined to follow. */
+export interface AttackChainSuppressedPivot {
+  kind: string;
+  value: string;
+  /** `generic_account` (shared by many principals) or `high_fanout`. */
+  reason: "generic_account" | "high_fanout" | string;
+  alertCount: number | null;
 }
 
 /** Entity nodes & edges rendered side-by-side with the timeline.
@@ -5121,8 +5155,13 @@ export interface AttackChainTimeline {
   window: string;
   seedAlertId: string;
   chainSignature: string | null;
-  /** 0..1 — substrate-level confidence in the chain reconstruction. */
+  /** 0..1 — mean evidence strength of the links. Not a calibrated probability. */
   confidence: number;
+  /** True when matching alerts were left out; null when the server did not say. */
+  truncated: boolean | null;
+  /** `sweep_limit` (a search hit its row limit) and/or `max_length`. */
+  truncatedReasons: string[];
+  suppressedPivots: AttackChainSuppressedPivot[];
   generatedAt: string;
   chain: AttackChainLink[];
   entityGraph: {
@@ -5139,6 +5178,14 @@ interface BackendAttackChainResponse {
   seed_alert_id: string | null;
   chain_signature: string | null;
   confidence: number;
+  truncated?: boolean;
+  truncated_reasons?: string[];
+  suppressed_pivots?: Array<{
+    kind: string;
+    value: string;
+    reason: string;
+    alert_count: number | null;
+  }>;
   generated_at: string;
   chain: Array<{
     alert_id: string;
@@ -5152,6 +5199,11 @@ interface BackendAttackChainResponse {
     mitre_techniques: string[];
     connector_type: string | null;
     source_event_ids: string[];
+    via_alert_id?: string | null;
+    strength?: number;
+    stage?: number | null;
+    tactic?: string | null;
+    out_of_sequence?: boolean;
   }>;
   entity_graph: {
     nodes: AttackChainEntityNode[];

@@ -150,3 +150,25 @@ jobs:
           fi
           cp /tmp/attack_chain.bak app/services/attack_chain.py
           echo "OK: dropping the overflow row makes the suite fail, as it must."
+
+      - name: Matching stored values case-sensitively makes the normalisation proof fail
+        working-directory: services/api
+        run: |
+          cp app/services/attack_chain.py /tmp/attack_chain.bak
+          python - <<'PY'
+          import pathlib, sys
+          p = pathlib.Path("app/services/attack_chain.py")
+          s = p.read_text()
+          needle = "lower(alerts.{column}::text)::jsonb ?|"
+          if needle not in s:
+              print("negative control: case-insensitive probe not found — the loader has been reshaped")
+              sys.exit(1)
+          p.write_text(s.replace(needle, "alerts.{column} ?|", 1))
+          PY
+          if python -m pytest tests/test_attack_chain_live_postgres.py -q >/dev/null 2>&1; then
+            cp /tmp/attack_chain.bak app/services/attack_chain.py
+            echo "FAIL: the suite passed with case-sensitive matching of stored values."
+            exit 1
+          fi
+          cp /tmp/attack_chain.bak app/services/attack_chain.py
+          echo "OK: case-sensitive matching makes the suite fail, as it must."
