@@ -131,13 +131,19 @@ async def get_attack_chain(
         }
 
     loader = PostgresAttackChainLoader(db)
-    chain: AttackChain | None = await compute_attack_chain(
-        seed_alert_id=seed_alert_id,
-        tenant_id=user.tenant_id,
-        loader=loader,
-        window=_WINDOW_TO_TIMEDELTA[window],
-        window_label=window,
-    )
+    try:
+        chain: AttackChain | None = await compute_attack_chain(
+            seed_alert_id=seed_alert_id,
+            tenant_id=user.tenant_id,
+            loader=loader,
+            window=_WINDOW_TO_TIMEDELTA[window],
+            window_label=window,
+        )
+    except Exception:
+        # Fail closed: a database error must not read as "no related
+        # alerts". The caller is told the chain could not be built.
+        logger.exception("attack_chain computation failed case_id=%s", case_id)
+        raise HTTPException(status_code=503, detail="attack_chain_unavailable") from None
     if chain is None:
         raise HTTPException(status_code=404, detail="seed_alert_not_found")
 

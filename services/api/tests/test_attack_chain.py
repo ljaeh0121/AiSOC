@@ -272,9 +272,10 @@ def test_lockbit_chain_returns_four_links() -> None:
     assert {link.alert_id for link in chain.chain} == {A2_ID, A3_ID, A4_ID, A5_ID}
 
 
-def test_lockbit_chain_orders_by_score_desc() -> None:
-    """Depth-1 / t+5m credential-harvest alert (A2) outranks the
-    depth-2 / t+8h exfil alert (A5)."""
+def test_lockbit_chain_reads_in_attack_stage_order_not_score_order() -> None:
+    """The timeline is ordered by ATT&CK stage then time, not by score:
+    credential harvest (initial access) -> cloud auth -> S3 enumeration
+    (discovery) -> exfil (collection/exfiltration)."""
     alerts = _build_lockbit_chain()
     loader = _InMemoryLoader(alerts)
     chain = asyncio.run(
@@ -289,11 +290,7 @@ def test_lockbit_chain_orders_by_score_desc() -> None:
     )
     assert chain is not None
     ordering = [link.alert_id for link in chain.chain]
-    assert ordering[0] == A2_ID  # depth-1, t+5m, shared user → highest score
-    assert ordering.index(A2_ID) < ordering.index(A5_ID)
-    # All scores are non-increasing.
-    scores = [link.score for link in chain.chain]
-    assert scores == sorted(scores, reverse=True)
+    assert ordering == [A2_ID, A3_ID, A4_ID, A5_ID]
 
 
 def test_lockbit_chain_provenance_records_shared_user() -> None:
@@ -448,3 +445,185 @@ def test_chain_signature_helper_pure_seed_only_chain() -> None:
     when the chain is empty (seed-only)."""
     sig = _chain_signature(SEED_ID, [])
     assert re.fullmatch(r"[0-9a-f]{32}", sig), sig
+
+
+# ---------------------------------------------------------------------------
+# Plan 4 — attack-chain precision
+# ---------------------------------------------------------------------------
+
+
+class _RecordingLoader(_InMemoryLoader):
+    """In-memory loader that records every entity set it is asked about and
+    can truncate each answer the way the production ``LIMIT`` does."""
+
+    def __init__(self, alerts: list[CandidateAlert], *, per_call_limit: int | None = None) -> None:
+        super().__init__(alerts)
+        self.calls: list[set[tuple[str, str]]] = []
+        self._limit = per_call_limit
+
+    async def load_candidates_for_entities(
+        self,
+        tenant_id: uuid.UUID,
+        entities: Iterable[tuple[str, str]],
+        start: datetime,
+        end: datetime,
+        exclude_ids: set[uuid.UUID],
+    ) -> list[CandidateAlert]:
+        ents = set(entities)
+        self.calls.append(ents)
+        rows = await super().load_candidates_for_entities(tenant_id, ents, start, end, exclude_ids)
+        rows.sort(key=lambda r: r.event_time)
+        return rows[: self._limit] if self._limit else rows
+
+
+def _run(alerts: list[CandidateAlert], loader: _InMemoryLoader | None = None, **kw):
+    return asyncio.run(
+        compute_attack_chain(
+            seed_alert_id=SEED_ID,
+            tenant_id=TENANT,
+            loader=loader or _InMemoryLoader(alerts),
+            window=DEFAULT_WINDOW,
+            window_label="24h",
+            now=T0,
+            **kw,
+        )
+    )
+
+
+def test_an_entity_is_never_queried_twice() -> None:
+    """Production truncates each sweep with a LIMIT, so an alert that shares
+    an already-queried entity can surface at depth 2. Its entities must not
+    send that entity back into the frontier."""
+    seed = CandidateAlert(id=SEED_ID, tenant_id=TENANT, title="seed", severity="high", event_time=T0, affected_users=("jdoe",))
+    a = CandidateAlert(
+        id=uuid.uuid4(),
+        tenant_id=TENANT,
+        title="a",
+        severity="high",
+        event_time=T0 + timedelta(minutes=1),
+        affected_users=("jdoe",),
+        affected_hosts=("hostx",),
+    )
+    b = CandidateAlert(
+        id=uuid.uuid4(),
+        tenant_id=TENANT,
+        title="b",
+        severity="high",
+        event_time=T0 + timedelta(minutes=2),
+        affected_users=("jdoe",),
+    )
+    c = CandidateAlert(
+        id=uuid.uuid4(),
+        tenant_id=TENANT,
+        title="c",
+        severity="high",
+        event_time=T0 + timedelta(minutes=3),
+        affected_users=("jdoe",),
+        affected_hosts=("hostx",),
+    )
+    loader = _RecordingLoader([seed, a, b, c], per_call_limit=1)
+    assert _run([], loader) is not None
+    queried = [e for call in loader.calls for e in call]
+    assert len(queried) == len(set(queried)), queried
+
+
+def test_lockbit_multihop_alerts_still_found_at_depth_two() -> None:
+    chain = _run(_build_lockbit_chain())
+    assert chain is not None
+    by_id = {link.alert_id: link for link in chain.chain}
+    assert by_id[A4_ID].distance == 2
+    assert by_id[A5_ID].distance == 2
+
+
+def test_chain_reads_in_attack_stage_order() -> None:
+    chain = _run(_build_lockbit_chain())
+    assert chain is not None
+    # initial access -> initial access -> discovery -> collection/exfil
+    assert [link.alert_id for link in chain.chain] == [A2_ID, A3_ID, A4_ID, A5_ID]
+
+
+def _unmapped_alert(severity: str = "high") -> CandidateAlert:
+    return CandidateAlert(
+        id=uuid.uuid4(),
+        tenant_id=TENANT,
+        title="Untagged anomaly on the same user",
+        severity=severity,
+        event_time=T0 + timedelta(minutes=1),  # earliest of all candidates
+        affected_users=("jdoe@acme.test",),
+    )
+
+
+def test_unmapped_mitre_alerts_sorted_last() -> None:
+    unmapped = _unmapped_alert()
+    chain = _run([*_build_lockbit_chain(), unmapped])
+    assert chain is not None
+    assert chain.chain[-1].alert_id == unmapped.id
+    assert len(chain.chain) == 5  # kept, not dropped
+
+
+def test_unknown_technique_ids_count_as_unmapped() -> None:
+    odd = CandidateAlert(
+        id=uuid.uuid4(),
+        tenant_id=TENANT,
+        title="Tagged with a technique we have no tactic for",
+        severity="high",
+        event_time=T0 + timedelta(minutes=1),
+        mitre_techniques=("T9999",),
+        affected_users=("jdoe@acme.test",),
+    )
+    chain = _run([*_build_lockbit_chain(), odd])
+    assert chain is not None
+    assert chain.chain[-1].alert_id == odd.id
+
+
+def test_truncation_keeps_highest_scoring_links_not_earliest_stage() -> None:
+    """Stage order is a presentation order; the cap must still keep the best."""
+    unmapped = _unmapped_alert()
+    chain = _run([*_build_lockbit_chain(), unmapped], max_length=2)
+    assert chain is not None
+    assert len(chain.chain) == 2
+    assert unmapped.id in {link.alert_id for link in chain.chain}  # highest score overall
+
+
+def test_confidence_excludes_seed() -> None:
+    unmapped = _unmapped_alert()
+    chain = _run([*_build_lockbit_chain(), unmapped])
+    assert chain is not None
+    best = max(link.score for link in chain.chain)
+    assert chain.confidence == pytest.approx(best)
+    assert chain.chain[0].score < best  # best candidate is not first in stage order
+    assert chain.confidence < 1.0  # the seed's implicit 1.0 never leaks in
+
+
+def test_depth2_link_has_via_alert() -> None:
+    chain = _run(_build_lockbit_chain())
+    assert chain is not None
+    by_id = {link.alert_id: link for link in chain.chain}
+    assert by_id[A2_ID].via_alert_id is None
+    assert by_id[A3_ID].via_alert_id is None
+    assert by_id[A4_ID].via_alert_id == A3_ID
+    assert by_id[A5_ID].via_alert_id == A3_ID
+    # shared entities are with the intermediary, not the candidate's own set
+    assert {(e["kind"], e["value"]) for e in by_id[A4_ID].shared_entities} == {
+        ("Endpoint", "203.0.113.42"),
+        ("Resource", "s3://acme-research"),
+    }
+    assert {(e["kind"], e["value"]) for e in by_id[A5_ID].shared_entities} == {("Resource", "s3://acme-research")}
+    assert "via_alert_id" in by_id[A4_ID].to_dict()
+    assert by_id[A4_ID].to_dict()["via_alert_id"] == str(A3_ID)
+
+
+def test_entity_graph_links_intermediary_alert_to_pivot_entities() -> None:
+    chain = _run(_build_lockbit_chain())
+    assert chain is not None
+    edges = {(e["source"], e["target"]) for e in chain.entity_graph["edges"]}
+    assert (f"alert:{A3_ID}", "endpoint:203.0.113.42") in edges
+
+
+def test_loader_exception_propagates() -> None:
+    class _Broken(_InMemoryLoader):
+        async def load_candidates_for_entities(self, *a, **k):
+            raise RuntimeError("db down")
+
+    with pytest.raises(RuntimeError, match="db down"):
+        _run([], _Broken(_build_lockbit_chain()))
