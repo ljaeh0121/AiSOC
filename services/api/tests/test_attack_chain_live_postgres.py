@@ -71,16 +71,31 @@ def _alert(tenant: uuid.UUID, title: str, minutes: int, **kw) -> CandidateAlert:
     )
 
 
+async def _ensure_session(db, a: CandidateAlert) -> None:
+    if not a.session_id:
+        return
+    await db.execute(
+        text(
+            "INSERT INTO sessions (id, tenant_id, session_key, key_kind, source, first_seen_at, last_seen_at)"
+            " VALUES (CAST(:i AS uuid), :t, :k, :kk, 'test', :et, :et) ON CONFLICT DO NOTHING"
+        ),
+        {"i": a.session_id, "t": a.tenant_id, "k": a.session_id, "kk": a.session_key_kind or "vendor_session", "et": a.event_time},
+    )
+
+
 async def _insert(db, a: CandidateAlert) -> None:
+    await _ensure_session(db, a)
     await db.execute(
         text(
             """
             INSERT INTO alerts (id, tenant_id, title, severity, status, event_time,
-                                mitre_techniques, affected_users, affected_hosts,
-                                affected_ips, affected_assets, connector_type, source_event_ids)
+                                mitre_techniques, mitre_tactics, affected_users, affected_hosts,
+                                affected_ips, affected_assets, connector_type, source_event_ids,
+                                session_id, session_key_kind, originating_human)
             VALUES (:id, :t, :title, :sev, 'new', :et,
-                    CAST(:m AS JSONB), CAST(:u AS JSONB), CAST(:h AS JSONB),
-                    CAST(:i AS JSONB), CAST(:a AS JSONB), :c, CAST(:s AS JSONB))
+                    CAST(:m AS JSONB), CAST(:mt AS JSONB), CAST(:u AS JSONB), CAST(:h AS JSONB),
+                    CAST(:i AS JSONB), CAST(:a AS JSONB), :c, CAST(:s AS JSONB),
+                    CAST(:sid AS uuid), :skind, :human)
             """
         ),
         {
@@ -90,6 +105,10 @@ async def _insert(db, a: CandidateAlert) -> None:
             "sev": a.severity,
             "et": a.event_time,
             "m": json.dumps(list(a.mitre_techniques)),
+            "mt": json.dumps(list(a.mitre_tactics)),
+            "sid": a.session_id,
+            "skind": a.session_key_kind,
+            "human": a.originating_human,
             "u": json.dumps(list(a.affected_users)),
             "h": json.dumps(list(a.affected_hosts)),
             "i": json.dumps(list(a.affected_ips)),
@@ -124,6 +143,7 @@ async def world():
 
     async with maker() as db:
         await db.execute(text("DELETE FROM alerts WHERE tenant_id IN (:a, :b)"), {"a": a, "b": b})
+        await db.execute(text("DELETE FROM sessions WHERE tenant_id IN (:a, :b)"), {"a": a, "b": b})
         await db.execute(text("DELETE FROM tenants WHERE id IN (:a, :b)"), {"a": a, "b": b})
         await db.commit()
     await engine.dispose()
@@ -311,3 +331,104 @@ async def test_alerts_sharing_only_a_value_that_names_nothing_are_not_linked(wor
 
     assert chain is not None
     assert chain.chain == []
+
+
+SESSION = "6f1b0e2a-9a3d-5c7e-8b4f-1d2c3e4f5a6b"
+OTHER_SESSION = "7a2c1f3b-0b4e-4d8f-9c5a-2e3d4f5a6b7c"
+
+
+async def test_alerts_of_one_session_are_linked_in_postgres(world) -> None:
+    maker, a, _b, insert = world
+    seed = _alert(a, "seed", 0, session_id=SESSION, session_key_kind="vendor_session")
+    same = _alert(a, "same session", 5, session_id=SESSION, session_key_kind="vendor_session")
+    other = _alert(a, "another session", 6, session_id=OTHER_SESSION, session_key_kind="vendor_session")
+    await insert(seed, same, other)
+
+    chain = await _chain(maker, a, seed.id)
+
+    assert chain is not None
+    assert {link.alert_id for link in chain.chain} == {same.id}
+    assert chain.chain[0].shared_entities == [{"kind": "Session", "value": SESSION}]
+
+
+async def test_the_same_session_in_another_tenant_never_joins(world) -> None:
+    maker, a, b, insert = world
+    seed = _alert(a, "seed", 0, session_id=SESSION, session_key_kind="vendor_session")
+    foreign = _alert(b, "other tenant", 5, session_id=SESSION, session_key_kind="vendor_session")
+    await insert(seed, foreign)
+
+    chain = await _chain(maker, a, seed.id)
+
+    assert chain is not None
+    assert chain.chain == []
+
+
+async def test_a_resolved_human_matches_regardless_of_case_in_postgres(world) -> None:
+    maker, a, _b, insert = world
+    seed = _alert(a, "seed", 0, originating_human="alice@example.com")
+    other = _alert(a, "assumed role", 5, originating_human="Alice@Example.com")
+    await insert(seed, other)
+
+    chain = await _chain(maker, a, seed.id)
+
+    assert chain is not None
+    assert {link.alert_id for link in chain.chain} == {other.id}
+
+
+async def test_a_weak_match_to_a_session_anchored_alert_is_refused_in_postgres(world) -> None:
+    maker, a, _b, insert = world
+    seed = _alert(a, "seed", 0, session_id=SESSION, session_key_kind="vendor_session", affected_hosts=("h1",))
+    same = _alert(a, "same session", 5, session_id=SESSION, session_key_kind="vendor_session")
+    host_only = _alert(a, "host only", 6, affected_hosts=("h1",))
+    await insert(seed, same, host_only)
+
+    chain = await _chain(maker, a, seed.id)
+
+    assert chain is not None
+    assert {link.alert_id for link in chain.chain} == {same.id}
+    assert chain.weak_links_refused == 1
+
+
+async def test_a_stored_tactic_places_the_alert_on_the_kill_chain(world) -> None:
+    maker, a, _b, insert = world
+    seed = _alert(a, "seed", 0, affected_users=(USER,))
+    other = _alert(a, "exfil", 5, affected_users=(USER,), mitre_tactics=("exfiltration",))
+    await insert(seed, other)
+
+    chain = await _chain(maker, a, seed.id)
+
+    assert chain is not None
+    assert (chain.chain[0].stage, chain.chain[0].tactic) == (12, "exfiltration")
+
+
+@pytest.mark.parametrize("nat_hub", [False, True], ids=["fusion-noise", "nat-hub-noise"])
+async def test_the_labelled_scenarios_are_recovered_through_the_real_sql(world, nat_hub: bool) -> None:
+    """The same authored world the in-memory evaluation grades, but read back
+    out of ``alerts`` by the production loader."""
+    from _attack_chain_scenarios import labelled_world
+
+    maker, a, _b, insert = world
+    scenarios, noise = labelled_world(a, T0, nat_hub=nat_hub, session_of=lambda s: str(uuid.uuid5(uuid.NAMESPACE_URL, s)))
+    await insert(*[x for alerts in scenarios.values() for x in alerts], *noise)
+
+    for label, alerts in scenarios.items():
+        chain = await _chain(maker, a, alerts[0].id)
+        assert chain is not None
+        found = {link.alert_id for link in chain.chain}
+        assert found == {x.id for x in alerts[1:]}, f"{label}: {sorted(link.title for link in chain.chain)}"
+
+
+async def test_a_derived_session_read_back_from_postgres_is_weaker_than_a_vendor_one(world) -> None:
+    maker, a, _b, insert = world
+    vendor = _alert(a, "vendor seed", 0, session_id=SESSION, session_key_kind="vendor_session")
+    vendor_peer = _alert(a, "vendor peer", 5, session_id=SESSION, session_key_kind="vendor_session")
+    derived = _alert(a, "derived seed", 0, session_id=OTHER_SESSION, session_key_kind="derived")
+    derived_peer = _alert(a, "derived peer", 5, session_id=OTHER_SESSION, session_key_kind="derived")
+    await insert(vendor, vendor_peer, derived, derived_peer)
+
+    strong = await _chain(maker, a, vendor.id)
+    weaker = await _chain(maker, a, derived.id)
+
+    assert strong is not None and weaker is not None
+    assert weaker.chain[0].shared_entities == [{"kind": "DerivedSession", "value": OTHER_SESSION}]
+    assert weaker.chain[0].strength < strong.chain[0].strength

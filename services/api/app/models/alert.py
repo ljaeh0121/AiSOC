@@ -78,6 +78,13 @@ class Alert(Base):
     src_ip_class: Mapped[str | None] = mapped_column(Text, nullable=True)
     src_ip_class_dataset_version: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Session context (migration 102). NULL is "no session context", never a
+    # session of one. `session_key_kind` says how strongly the grouping is
+    # known: three kinds are the vendor's own, `derived` is ours.
+    session_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    session_key_kind: Mapped[str | None] = mapped_column(Text, nullable=True)
+    originating_human: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # Entities (denormalized for fast querying)
     affected_ips: Mapped[list] = mapped_column(JSONB, default=list)
     affected_hosts: Mapped[list] = mapped_column(JSONB, default=list)

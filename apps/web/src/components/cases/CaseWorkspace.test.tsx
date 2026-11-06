@@ -220,6 +220,7 @@ describe('CaseWorkspace', () => {
         confidence: 0.82,
         truncated: false,
         truncatedReasons: [],
+        weakLinksRefused: 0,
         suppressedPivots: [],
         generatedAt: now,
         // The seed is not a member of the chain; the API returns only the
@@ -383,8 +384,12 @@ describe('CaseWorkspace', () => {
         const timeline = await load();
         show(timeline);
 
-        expect(within(card(timeline, 'Credential')).getByText(/evidence 96%/i)).toBeInTheDocument();
-        expect(within(card(timeline, 'S3 bucket')).getByText(/evidence 43%/i)).toBeInTheDocument();
+        for (const prefix of ['Credential', 'S3 bucket']) {
+          const strength = FIXTURE.chain.find((l: any) => l.title.startsWith(prefix)).strength;
+          expect(
+            within(card(timeline, prefix)).getByText(`evidence ${Math.round(strength * 100)}%`),
+          ).toBeInTheDocument();
+        }
       });
 
       it('explains what the confidence figure is', async () => {
@@ -438,6 +443,24 @@ describe('CaseWorkspace', () => {
         expect(note).toHaveTextContent(/30 alerts/i);
         expect(note).toHaveTextContent('system');
         expect(note).toHaveTextContent(/shared account/i);
+      });
+
+      it('says how many alerts were left out as weak-string joins', async () => {
+        const timeline = await load((b) => {
+          b.weak_links_refused = 2;
+        });
+        show(timeline);
+
+        const note = screen.getByTestId('chain-weak-refused');
+        expect(note).toHaveTextContent(/2 alerts/i);
+        expect(note).toHaveTextContent(/session/i);
+      });
+
+      it('is silent about weak-string joins when none were refused', async () => {
+        const timeline = await load();
+        show(timeline);
+
+        expect(screen.queryByTestId('chain-weak-refused')).not.toBeInTheDocument();
       });
 
       it('does not say that MITRE techniques link alerts', async () => {

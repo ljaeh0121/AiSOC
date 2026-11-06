@@ -27,9 +27,15 @@ We treat the alerts table as a bipartite (alert ↔ entity) graph, then:
      (``normalize_entity``): case and padding never distinguish two of them,
      IPs compare by address, and values that name nothing (``-``,
      ``localhost``, loopback/link-local addresses) are dropped.
-  2. Sweep all alerts in the window whose ``affected_*`` lists intersect
-     ``E_seed`` — these are the depth-1 candidates. Shared accounts
-     (``SYSTEM``, ``root``, ...) are never followed.
+  2. Sweep all alerts in the window whose ``affected_*`` lists, session or
+     resolved human intersect ``E_seed`` — these are the depth-1 candidates.
+     Shared accounts (``SYSTEM``, ``root``, ...) are never followed. A
+     session or resolved human is *strong* evidence (one authenticated
+     context); a user, host, address or resource is a bare string and *weak*.
+     A candidate that matches only by a weak string is refused when the alert
+     it would attach to is anchored on a strong one — the rule the story
+     grouper in services/fusion was found to need by measurement, and
+     counted in ``weak_links_refused`` so the omission is visible.
   3. For each candidate, repeat the sweep with *all* of that candidate's
      entities (depth 2, 3). A cumulative ``seen_entities`` set guarantees no
      entity is queried twice. An entity reached by expansion that more than
@@ -216,17 +222,30 @@ def normalize_entity(kind: str, value: object) -> str | None:
     return v
 
 
+#: Entity kinds that name one authenticated context: a session, or the human
+#: behind an assumed-role chain. Everything else is a bare string — a user
+#: name, a host, an address — which two unrelated alerts can share by chance.
+#: The story grouper in services/fusion draws the same line (STRONG vs WEAK).
+_STRONG_KINDS: frozenset[str] = frozenset({"Session", "Human"})
+
+
 def _entity_weight(kind: str, value: str) -> float:
     """How much one shared entity of this kind says about 'same campaign'."""
+    if kind == "Session":
+        return 0.95  # the vendor named it, or it is the credential itself
+    if kind == "Human":
+        return 0.9
+    if kind == "DerivedSession":
+        return 0.7  # a principal+address+client grouping we made ourselves
     if kind == "Identity":
-        return 0.15 if is_generic_account(value) else 0.9
+        return 0.15 if is_generic_account(value) else 0.6
     if kind == "Resource":
-        return 0.8
+        return 0.6
     try:
         ipaddress.ip_address(value)
     except ValueError:
-        return 0.9  # a hostname
-    return 0.5  # an address: NAT, proxies and src/dst ambiguity make it weaker
+        return 0.6  # a hostname
+    return 0.35  # an address: NAT, proxies and src/dst ambiguity make it weakest
 
 
 def _rarity(alert_count: int) -> float:
@@ -521,6 +540,16 @@ class CandidateAlert:
     affected_assets: tuple[str, ...] = ()
     connector_type: str | None = None
     source_event_ids: tuple[str, ...] = ()
+    #: ATT&CK tactic names the alert itself carries (``initial-access``), when
+    #: its source supplied them. Detection alerts usually carry techniques only.
+    mitre_tactics: tuple[str, ...] = ()
+    #: The authenticated session the alert came out of, how strongly that
+    #: grouping is known (``vendor_session`` ... ``derived``), and the human
+    #: behind an assumed-role chain. ``None`` is "no session context", never a
+    #: session of one.
+    session_id: str | None = None
+    session_key_kind: str | None = None
+    originating_human: str | None = None
 
     def entities(self) -> set[tuple[str, str]]:
         """Return the set of normalised (kind, value) entity tuples."""
@@ -535,6 +564,15 @@ class CandidateAlert:
                 value = normalize_entity(kind, raw)
                 if value:
                     out.add((kind, value))
+        if self.session_id:
+            kind = "DerivedSession" if (self.session_key_kind or "").strip().lower() == "derived" else "Session"
+            value = normalize_entity(kind, self.session_id)
+            if value:
+                out.add((kind, value))
+        if self.originating_human:
+            value = normalize_entity("Human", self.originating_human)
+            if value:
+                out.add(("Human", value))
         return out
 
 
@@ -614,6 +652,10 @@ class AttackChain:
     #: ``high_fanout`` (touched by more than ``HUB_FANOUT`` alerts, reached by
     #: expansion). Alerts reachable only through them are not in the chain.
     suppressed_pivots: list[dict[str, Any]] = field(default_factory=list)
+    #: Alerts left out because they joined only by a bare string (host, user,
+    #: address) an alert already anchored on a session or resolved human, and
+    #: were not reachable any other way. Counted so the omission is visible.
+    weak_links_refused: int = 0
     generated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def to_dict(self) -> dict[str, Any]:
@@ -628,6 +670,7 @@ class AttackChain:
             "truncated": self.truncated,
             "truncated_reasons": self.truncated_reasons,
             "suppressed_pivots": self.suppressed_pivots,
+            "weak_links_refused": self.weak_links_refused,
             "generated_at": self.generated_at.isoformat(),
         }
 
@@ -725,10 +768,18 @@ def _risk_overlap(seed: CandidateAlert, cand: CandidateAlert) -> float:
     return (jaccard + sev_term) / 2.0
 
 
+_TACTIC_ALIASES: dict[str, str] = {"stealth": "defense-evasion", "defense-impairment": "defense-evasion"}
+
+
 def _stage_index(alert: CandidateAlert) -> int:
-    """Earliest kill-chain stage any of the alert's techniques belongs to, or
-    ``UNMAPPED_STAGE`` when none can be placed."""
+    """Earliest kill-chain stage among the alert's own tactics and its
+    techniques' tactics, or ``UNMAPPED_STAGE`` when none can be placed."""
     stages = []
+    for name in alert.mitre_tactics or ():
+        key = str(name).strip().lower().replace("_", "-").replace(" ", "-")
+        stage = MITRE_TACTIC_ORDER.get(_TACTIC_ALIASES.get(key, key))
+        if stage is not None:
+            stages.append(stage)
     for tid in alert.mitre_techniques or ():
         stage = _TECHNIQUE_STAGE.get(str(tid).strip().upper().split(".")[0])
         if stage is not None:
@@ -881,6 +932,7 @@ async def compute_attack_chain(
     # How many known alerts touch each entity: the basis of its rarity.
     entity_count: Counter[tuple[str, str]] = Counter(seed_entities)
     suppressed: dict[tuple[str, str], dict[str, Any]] = {}
+    refused: set[uuid.UUID] = set()
     sweep_truncated = False
 
     for depth in range(1, max_depth + 1):
@@ -932,25 +984,38 @@ async def compute_attack_chain(
         for row in rows:
             if row.id in known:
                 continue
+            row_entities = row.entities()
+            # Which alert hangs this one on the chain: the seed at depth 1,
+            # else the earliest depth-(n-1) alert that holds a frontier entity
+            # this one holds too (id breaks ties). A bare-string join to an
+            # alert anchored on a session or resolved human is refused — see
+            # ``weak_links_refused`` — so try each candidate bridge in turn.
+            sources = (
+                [seed]
+                if depth == 1
+                else sorted(
+                    (a for a in by_depth.get(depth - 1, []) if a.entities() & row_entities & frontier),
+                    key=lambda a: (a.event_time, str(a.id)),
+                )
+            )
+            chosen: tuple[CandidateAlert | None, set[tuple[str, str]]] | None = None if sources else (None, set())
+            for source in sources:
+                source_entities = source.entities()
+                shared = source_entities & row_entities
+                anchored = any(kind in _STRONG_KINDS for kind, _ in source_entities)
+                if anchored and not any(kind in _STRONG_KINDS for kind, _ in shared):
+                    continue
+                chosen = (source, shared)
+                break
+            if chosen is None:
+                refused.add(row.id)
+                continue
+            bridge, shared = chosen
             known[row.id] = (row, depth)
             candidate_index[row.id] = row
             by_depth.setdefault(depth, []).append(row)
-            entity_count.update(row.entities())
-            if depth == 1:
-                via_of[row.id] = (None, row.entities() & seed_entities)
-            else:
-                # Bridged in by the earliest depth-(n-1) alert that holds a
-                # frontier entity this one holds too (id breaks ties), so the
-                # choice is deterministic.
-                bridges = sorted(
-                    (a for a in by_depth.get(depth - 1, []) if a.entities() & row.entities() & frontier),
-                    key=lambda a: (a.event_time, str(a.id)),
-                )
-                bridge = bridges[0] if bridges else None
-                via_of[row.id] = (
-                    bridge.id if bridge else None,
-                    (bridge.entities() & row.entities()) if bridge else set(),
-                )
+            entity_count.update(row_entities)
+            via_of[row.id] = (None if depth == 1 else (bridge.id if bridge else None), shared)
             # Expand with *all* of this row's entities so depth+1 can attach
             # alerts that share its entities rather than the seed's ("S3
             # enumeration -> exfil" via the cloud user).
@@ -1032,6 +1097,7 @@ async def compute_attack_chain(
         chain_signature=signature,
         confidence=confidence,
         suppressed_pivots=sorted(suppressed.values(), key=lambda d: (d["kind"], d["value"])),
+        weak_links_refused=len(refused - known.keys()),
         truncated=sweep_truncated or length_truncated,
         truncated_reasons=[reason for reason, hit in (("sweep_limit", sweep_truncated), ("max_length", length_truncated)) if hit],
     )
@@ -1080,6 +1146,8 @@ class PostgresAttackChainLoader:
         users: list[str] = []
         hosts: list[str] = []
         assets: list[str] = []
+        humans: list[str] = []
+        sessions: list[uuid.UUID] = []
         for kind, value in entities:
             if kind == "Identity":
                 users.append(value)
@@ -1087,6 +1155,13 @@ class PostgresAttackChainLoader:
                 hosts.append(value)
             elif kind == "Resource":
                 assets.append(value)
+            elif kind == "Human":
+                humans.append(value)
+            elif kind in ("Session", "DerivedSession"):
+                try:
+                    sessions.append(uuid.UUID(value))
+                except ValueError:
+                    pass  # not a uuid, so it cannot be any row's session_id
 
         # Case-insensitive probes; see ``_any_element_matches``.
         clauses = []
@@ -1101,6 +1176,10 @@ class PostgresAttackChainLoader:
             )
         if assets:
             clauses.append(_any_element_matches("affected_assets", "a", assets))
+        if humans:
+            clauses.append(_text_matches("originating_human", "hm", humans))
+        if sessions:
+            clauses.append(Alert.session_id.in_(sessions))  # alerts_session_idx
 
         if not clauses:
             return []
@@ -1152,6 +1231,16 @@ def _any_element_matches(column: str, param: str, values: list[str]) -> Any:
     ).bindparams(bindparam(param, value=values, type_=ARRAY(String)))
 
 
+def _text_matches(column: str, param: str, values: list[str]) -> Any:
+    """SQL predicate: the text column ``alerts.<column>`` equals one of
+    ``values``, ignoring case (both sides lower-cased by the database)."""
+    from sqlalchemy import ARRAY, String, bindparam, text
+
+    return text(f"lower(alerts.{column}) IN (SELECT lower(p) FROM unnest(CAST(:{param} AS text[])) AS p)").bindparams(
+        bindparam(param, value=values, type_=ARRAY(String))
+    )
+
+
 def _row_to_candidate(row: Any) -> CandidateAlert:
     return CandidateAlert(
         id=row.id,
@@ -1166,4 +1255,8 @@ def _row_to_candidate(row: Any) -> CandidateAlert:
         affected_assets=tuple(row.affected_assets or ()),
         connector_type=row.connector_type,
         source_event_ids=tuple(row.source_event_ids or ()),
+        mitre_tactics=tuple(row.mitre_tactics or ()),
+        session_id=str(row.session_id) if row.session_id else None,
+        session_key_kind=row.session_key_kind,
+        originating_human=row.originating_human,
     )

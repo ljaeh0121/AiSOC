@@ -43,6 +43,7 @@ jobs:
       ENVIRONMENT: production
       SECRET_KEY: ci-attack-chain-signing-secret-at-least-32-chars
       ATTACK_CHAIN_PROOF_REQUIRED: "1"
+      ALERT_SINK_PROOF_REQUIRED: "1"
       OTEL_SDK_DISABLED: "true"
 
     steps:
@@ -78,6 +79,19 @@ jobs:
             tests/test_attack_chain_live_postgres.py \
             tests/test_attack_chain_endpoint_live.py \
             -v --tb=short
+
+      # The writing half: the sink must put a real alert's resources in the
+      # column the chain reads. Fusion has its own locked closure (it pins a
+      # different asyncpg from the API), so it gets its own virtualenv.
+      - name: The fusion sink writes affected_assets to a real row
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/.venv-fusion"
+          python3 scripts/service_requirements.py fusion --locked > /tmp/fusion.lock.txt
+          "$RUNNER_TEMP/.venv-fusion/bin/pip" install --quiet --disable-pip-version-check --no-deps -r /tmp/fusion.lock.txt
+          "$RUNNER_TEMP/.venv-fusion/bin/python" -c "import pytest, pytest_asyncio"
+          cd services/fusion
+          "$RUNNER_TEMP/.venv-fusion/bin/python" -m pytest tests/test_alert_sink_affected_assets_live.py -v --tb=short
 
       # ── Negative controls ──────────────────────────────────────────────
       #
@@ -172,3 +186,25 @@ jobs:
           fi
           cp /tmp/attack_chain.bak app/services/attack_chain.py
           echo "OK: case-sensitive matching makes the suite fail, as it must."
+
+      - name: Dropping the session probe makes the strong-link proof fail
+        working-directory: services/api
+        run: |
+          cp app/services/attack_chain.py /tmp/attack_chain.bak
+          python - <<'PY'
+          import pathlib, sys
+          p = pathlib.Path("app/services/attack_chain.py")
+          s = p.read_text()
+          needle = "clauses.append(Alert.session_id.in_(sessions))"
+          if needle not in s:
+              print("negative control: session probe not found — the loader has been reshaped")
+              sys.exit(1)
+          p.write_text(s.replace(needle, "pass", 1))
+          PY
+          if python -m pytest tests/test_attack_chain_live_postgres.py -q >/dev/null 2>&1; then
+            cp /tmp/attack_chain.bak app/services/attack_chain.py
+            echo "FAIL: the suite passed with sessions not probed in the sweep."
+            exit 1
+          fi
+          cp /tmp/attack_chain.bak app/services/attack_chain.py
+          echo "OK: not probing sessions makes the suite fail, as it must."

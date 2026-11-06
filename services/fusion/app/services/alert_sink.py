@@ -124,7 +124,8 @@ INSERT INTO alerts (
     rule_id, rule_name, external_id,
     affected_hosts, affected_users, affected_ips,
     session_id, session_key_kind, originating_human,
-    src_ip_class, src_ip_class_dataset_version
+    src_ip_class, src_ip_class_dataset_version,
+    affected_assets
 )
 SELECT
     $1, $2, $3, $4, $5, 'new',
@@ -135,7 +136,8 @@ SELECT
     $22, $23, $24,
     $25::jsonb, $26::jsonb, $27::jsonb,
     $28, $29, $30,
-    $31, $32
+    $31, $32,
+    $33::jsonb
 WHERE NOT EXISTS (
     SELECT 1 FROM alerts WHERE tenant_id = $2 AND dedup_hash = $11::text
 )
@@ -526,6 +528,48 @@ def _affected(fused: FusedAlert) -> tuple[list[str], list[str], list[str]]:
     return hosts, _usernames(fused), ips
 
 
+#: Most resources one alert records. An event naming hundreds (a bulk listing)
+#: is one finding about a place, not hundreds of pivots, and the column is
+#: JSONB on the hot row.
+_MAX_ASSETS = 20
+
+
+def _assets(fused: FusedAlert) -> list[str]:
+    """The resources this alert is about, for `affected_assets`.
+
+    The column has been mapped, served and filtered on since migration 042 and
+    written by nothing but `seed_demo.py`, so every real alert read as touching
+    no resource and the attack-chain API — which follows a shared bucket, repo
+    or key from one alert to the next — only ever saw them on seeded data.
+
+    Read from the same two places the rest of the product already treats as
+    "the resource": ingest's `activity.resource` projection (what the lake
+    writer stores as `resource_id`, id preferring over name), and the AWS
+    finding's `Resources` list (what the graph writer turns into `:Resource`
+    nodes). Values that are not non-empty strings are skipped, a resource named
+    twice is kept once, and the list is capped at `_MAX_ASSETS`.
+    """
+    raw = fused.alert.raw_event if isinstance(fused.alert.raw_event, dict) else {}
+    candidates: list[Any] = []
+
+    activity = raw.get("activity")
+    resource = activity.get("resource") if isinstance(activity, dict) else None
+    if isinstance(resource, dict):
+        candidates.append(resource.get("id") or resource.get("name"))
+
+    listed = raw.get("Resources")
+    if isinstance(listed, list):
+        for item in listed:
+            if isinstance(item, dict):
+                candidates.append(item.get("Id") or item.get("ARN"))
+
+    out: list[str] = []
+    for value in candidates:
+        if isinstance(value, str) and value.strip() and value.strip() not in out:
+            out.append(value.strip())
+    return out[:_MAX_ASSETS]
+
+
 def _insert_args(fused: FusedAlert) -> tuple[Any, ...]:
     """The positional arguments `_INSERT_SQL` takes, in order.
 
@@ -569,6 +613,7 @@ def _insert_args(fused: FusedAlert) -> tuple[Any, ...]:
         fused.originating_human,
         alert.src_ip_class,
         alert.src_ip_class_dataset_version,
+        json.dumps(_assets(fused)),
     )
 
 

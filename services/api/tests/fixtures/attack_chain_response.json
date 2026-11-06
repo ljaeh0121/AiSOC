@@ -28,7 +28,7 @@
         "evt-cred-002"
       ],
       "stage": 2,
-      "strength": 0.9568,
+      "strength": 0.7514,
       "tactic": "initial-access",
       "title": "Credential harvesting via fake O365 login portal",
       "via_alert_id": null
@@ -55,7 +55,7 @@
         "evt-auth-003"
       ],
       "stage": 2,
-      "strength": 0.5678,
+      "strength": 0.3786,
       "tactic": "initial-access",
       "title": "Cloud auth anomaly: impossible-travel sign-in to AWS console",
       "via_alert_id": null
@@ -87,7 +87,7 @@
         "evt-enum-004"
       ],
       "stage": 8,
-      "strength": 0.4272,
+      "strength": 0.2256,
       "tactic": "discovery",
       "title": "S3 bucket enumeration from unusual ASN",
       "via_alert_id": "00000000-0000-0000-0000-000000001002"
@@ -115,14 +115,14 @@
         "evt-exfil-005"
       ],
       "stage": 10,
-      "strength": 0.2866,
+      "strength": 0.1433,
       "tactic": "collection",
       "title": "Large outbound data egress from S3 to unknown destination",
       "via_alert_id": "00000000-0000-0000-0000-000000001002"
     }
   ],
   "chain_signature": "7b06272393accbd1e79d55f0a9a19ff9",
-  "confidence": 0.5596,
+  "confidence": 0.3747,
   "entity_graph": {
     "edges": [
       {
@@ -239,5 +239,6 @@
   "tenant_id": "00000000-0000-0000-0000-000000000777",
   "truncated": false,
   "truncated_reasons": [],
+  "weak_links_refused": 0,
   "window": "24h"
 }

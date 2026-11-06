@@ -1800,6 +1800,13 @@ function AttackChainPanel({ caseId }: { caseId: string }) {
           This server did not report whether the chain is complete.
         </p>
       )}
+      {(data.weakLinksRefused ?? 0) > 0 && (
+        <p data-testid="chain-weak-refused" className="text-[11px] text-slate-500">
+          {data.weakLinksRefused} alert{data.weakLinksRefused === 1 ? "" : "s"} not shown: they matched
+          only on a host, user or address string, and the alert they would attach to is anchored on a
+          session or resolved human.
+        </p>
+      )}
       {data.suppressedPivots.length > 0 && (
         <p data-testid="chain-suppressed" className="text-[11px] text-slate-500">
           Not followed:{" "}

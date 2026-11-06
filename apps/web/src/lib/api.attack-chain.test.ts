@@ -57,7 +57,9 @@ describe('casesApi.getAttackChain mapping', () => {
 
     expect(credential.tactic).toBe('initial-access');
     expect(credential.stage).toBe(2);
-    expect(credential.strength!).toBeGreaterThan(0.9);
+    // The strongest link here shares a user and a host with the seed.
+    expect(credential.strength!).toBeGreaterThan(enumeration.strength!);
+    expect(credential.strength!).toBeGreaterThan(0.5);
     expect(credential.outOfSequence).toBe(false);
     expect(credential.viaAlertId).toBeNull();
 
@@ -91,6 +93,14 @@ describe('casesApi.getAttackChain mapping', () => {
     ]);
   });
 
+  it('carries how many alerts were refused as weak-string joins', async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ ...FIXTURE, weak_links_refused: 3 }));
+
+    const timeline = await casesApi.getAttackChain('case-1');
+
+    expect(timeline!.weakLinksRefused).toBe(3);
+  });
+
   it('reports a complete chain as complete, and an unmapped link as having no stage', async () => {
     const body = structuredClone(FIXTURE);
     body.chain[0].stage = null;
@@ -111,6 +121,7 @@ describe('casesApi.getAttackChain mapping', () => {
     delete legacy.truncated;
     delete legacy.truncated_reasons;
     delete legacy.suppressed_pivots;
+    delete legacy.weak_links_refused;
     for (const l of legacy.chain) {
       delete l.strength;
       delete l.stage;
@@ -124,6 +135,7 @@ describe('casesApi.getAttackChain mapping', () => {
 
     // Unknown is not "complete": the console must be able to tell the difference.
     expect(timeline!.truncated).toBeNull();
+    expect(timeline!.weakLinksRefused).toBeNull();
     expect(timeline!.chain[0].strength).toBeNull();
     expect(timeline!.chain[0].viaAlertId).toBeNull();
   });

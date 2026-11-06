@@ -2790,6 +2790,8 @@ export const casesApi = {
       // `null` means the server did not say; that must not read as "complete".
       truncated: typeof raw.truncated === "boolean" ? raw.truncated : null,
       truncatedReasons: raw.truncated_reasons ?? [],
+      weakLinksRefused:
+        typeof raw.weak_links_refused === "number" ? raw.weak_links_refused : null,
       suppressedPivots: (raw.suppressed_pivots ?? []).map((p) => ({
         kind: p.kind,
         value: p.value,
@@ -5161,6 +5163,12 @@ export interface AttackChainTimeline {
   truncated: boolean | null;
   /** `sweep_limit` (a search hit its row limit) and/or `max_length`. */
   truncatedReasons: string[];
+  /**
+   * Alerts left out because they joined only by a host, user or address
+   * string an alert already anchored on a session or resolved human; null when
+   * the server did not say.
+   */
+  weakLinksRefused: number | null;
   suppressedPivots: AttackChainSuppressedPivot[];
   generatedAt: string;
   chain: AttackChainLink[];
@@ -5180,6 +5188,7 @@ interface BackendAttackChainResponse {
   confidence: number;
   truncated?: boolean;
   truncated_reasons?: string[];
+  weak_links_refused?: number;
   suppressed_pivots?: Array<{
     kind: string;
     value: string;

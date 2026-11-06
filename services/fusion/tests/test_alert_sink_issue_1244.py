@@ -308,3 +308,80 @@ async def test_a_failing_dedup_update_does_not_change_the_outcome() -> None:
 
     result = await sink.persist(_fused(source_event_ids=["evt-4"]))
     assert result.outcome is PersistOutcome.DUPLICATE
+
+
+# ── affected_assets: the resource an event is about ───────────────────────
+#
+# `affected_assets` has been mapped, serialised and read since migration 042
+# and written by nothing but `seed_demo.py`. The attack-chain API pivots on it
+# (a bucket, a repository, a key), so every real alert read as touching no
+# resource at all and the cloud multi-hop chains only existed on seeded data.
+
+
+def _fused_with(raw_event: dict) -> FusedAlert:
+    raw = RawAlert(
+        tenant_id=TENANT,
+        source="CloudTrail",
+        title="Bucket enumeration",
+        severity=AlertSeverity.MEDIUM,
+        hostname="ip-10-0-0-5",
+        mitre_techniques=["T1580"],
+        raw_event=raw_event,
+        ocsf_class_uid=2004,
+    )
+    raw.id = raw.deterministic_id()
+    return FusedAlert(id=raw.id, tenant_id=TENANT, fusion_decision=FusionDecision.NEW_ALERT, alert=raw)
+
+
+async def _persisted_assets(raw_event: dict) -> list:
+    fused = _fused_with(raw_event)
+    pool = _StubPool(row={"id": fused.id})
+    sink = AlertSink("postgresql://x")
+    sink._pool = pool
+    assert (await sink.persist(fused)).outcome is PersistOutcome.INSERTED
+    sql, args = _insert_statement(pool)
+    return json.loads(_column_value(sql, args, "affected_assets"))
+
+
+@pytest.mark.asyncio
+async def test_the_activity_resource_is_persisted_as_an_affected_asset() -> None:
+    event = {"activity": {"resource": {"type": "s3_bucket", "id": "arn:aws:s3:::acme-research", "name": "acme-research"}}}
+    assert await _persisted_assets(event) == ["arn:aws:s3:::acme-research"]
+
+
+@pytest.mark.asyncio
+async def test_the_resource_name_stands_in_when_it_has_no_id() -> None:
+    assert await _persisted_assets({"activity": {"resource": {"type": "repo", "name": "acme/payments"}}}) == ["acme/payments"]
+
+
+@pytest.mark.asyncio
+async def test_aws_finding_resources_are_persisted_too() -> None:
+    """The same list the graph writer turns into :Resource nodes."""
+    event = {"Resources": [{"Id": "arn:aws:s3:::a"}, {"ARN": "arn:aws:iam::1:role/r"}, {"Type": "no id"}]}
+    assert await _persisted_assets(event) == ["arn:aws:s3:::a", "arn:aws:iam::1:role/r"]
+
+
+@pytest.mark.asyncio
+async def test_a_resource_named_twice_is_stored_once_in_first_seen_order() -> None:
+    event = {"activity": {"resource": {"id": "b"}}, "Resources": [{"Id": "a"}, {"Id": "b"}]}
+    assert await _persisted_assets(event) == ["b", "a"]
+
+
+@pytest.mark.asyncio
+async def test_an_event_with_no_resource_persists_an_empty_list_not_a_null() -> None:
+    assert await _persisted_assets({}) == []
+    assert await _persisted_assets({"activity": {"resource": {}}}) == []
+    assert await _persisted_assets({"activity": "not a dict", "Resources": "nor a list"}) == []
+
+
+@pytest.mark.asyncio
+async def test_unusable_resource_values_are_skipped() -> None:
+    event = {"Resources": [{"Id": ""}, {"Id": "   "}, {"Id": 42}, None, "bare", {"Id": "ok"}]}
+    assert await _persisted_assets(event) == ["ok"]
+
+
+@pytest.mark.asyncio
+async def test_a_runaway_resource_list_cannot_bloat_the_row() -> None:
+    event = {"Resources": [{"Id": f"r{i}"} for i in range(500)]}
+    stored = await _persisted_assets(event)
+    assert stored == [f"r{i}" for i in range(20)]

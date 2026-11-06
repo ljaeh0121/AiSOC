@@ -1,0 +1,107 @@
+{
+  "provenance": "The three multi-stage scenarios and the two noise alerts are adapted from services/fusion/tests/test_attack_stories.py (the story grouper's published measurement), re-expressed as alert rows the attack-chain API reads. 'nat-hub-noise' is added here: thirty unrelated alerts behind the same egress address. All are authored, not captured: they are a regression bar for the rules below, not evidence of accuracy on real incidents.",
+  "scenarios": {
+    "phish-then-session-reuse-then-cloud": [
+      {
+        "title": "Phishing link clicked",
+        "severity": "medium",
+        "tactics": [
+          "initial-access"
+        ],
+        "user": "alice@example.com",
+        "session": "sess-alice-1"
+      },
+      {
+        "title": "Session token replayed from a new ASN",
+        "severity": "high",
+        "tactics": [
+          "defense-evasion"
+        ],
+        "session": "sess-alice-1",
+        "src_ip": "203.0.113.5"
+      },
+      {
+        "title": "AssumeRole into the production account",
+        "severity": "high",
+        "tactics": [
+          "privilege-escalation"
+        ],
+        "session": "sess-alice-1",
+        "human": "alice@example.com"
+      },
+      {
+        "title": "S3 bulk read by the assumed role",
+        "severity": "high",
+        "tactics": [
+          "exfiltration"
+        ],
+        "human": "alice@example.com"
+      }
+    ],
+    "token-theft-then-repo-clone": [
+      {
+        "title": "Personal access token used from a new ASN",
+        "severity": "medium",
+        "tactics": [
+          "credential-access"
+        ],
+        "user": "bob",
+        "session": "sess-bob-1"
+      },
+      {
+        "title": "Burst of repository clones",
+        "severity": "high",
+        "tactics": [
+          "collection"
+        ],
+        "session": "sess-bob-1"
+      },
+      {
+        "title": "Archive download of a private repository",
+        "severity": "high",
+        "tactics": [
+          "exfiltration"
+        ],
+        "session": "sess-bob-1"
+      }
+    ],
+    "departing-employee-bulk-download": [
+      {
+        "title": "Drive bulk external sharing",
+        "severity": "medium",
+        "tactics": [
+          "collection"
+        ],
+        "user": "carol@example.com",
+        "session": "sess-carol-1"
+      },
+      {
+        "title": "Bulk download from Drive",
+        "severity": "medium",
+        "tactics": [
+          "exfiltration"
+        ],
+        "session": "sess-carol-1"
+      }
+    ]
+  },
+  "noise": [
+    {
+      "title": "Routine antivirus quarantine",
+      "severity": "low",
+      "src_ip": "203.0.113.5",
+      "host": "ws-900"
+    },
+    {
+      "title": "Password changed",
+      "severity": "info",
+      "src_ip": "203.0.113.5",
+      "host": "ws-901"
+    }
+  ],
+  "nat_hub_noise": {
+    "count": 30,
+    "src_ip": "203.0.113.5",
+    "title": "Unrelated activity behind the shared egress address"
+  }
+}

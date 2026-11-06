@@ -963,3 +963,177 @@ def test_response_body_matches_the_fixture_the_console_is_tested_against() -> No
     if os.environ.get("ATTACK_CHAIN_UPDATE_FIXTURE"):
         CONTRACT_FIXTURE.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     assert json.loads(CONTRACT_FIXTURE.read_text()) == payload
+
+
+# ---------------------------------------------------------------------------
+# Labelled scenarios: recall and precision
+# ---------------------------------------------------------------------------
+
+from _attack_chain_scenarios import labelled_world  # noqa: E402
+
+
+def _labelled_world(*, nat_hub: bool):
+    return labelled_world(TENANT, T0, nat_hub=nat_hub)
+
+
+def measure_scenarios(*, nat_hub: bool) -> dict[str, dict[str, float]]:
+    scenarios, noise = _labelled_world(nat_hub=nat_hub)
+    everything = [a for alerts in scenarios.values() for a in alerts] + noise
+    owner = {a.id: label for label, alerts in scenarios.items() for a in alerts}
+    out: dict[str, dict[str, float]] = {}
+    for label, alerts in scenarios.items():
+        seed, expected = alerts[0], {a.id for a in alerts[1:]}
+        chain = asyncio.run(
+            compute_attack_chain(
+                seed_alert_id=seed.id,
+                tenant_id=TENANT,
+                loader=_InMemoryLoader(everything),
+                window=DEFAULT_WINDOW,
+                window_label="24h",
+            )
+        )
+        assert chain is not None
+        found = {link.alert_id for link in chain.chain}
+        right = found & expected
+        out[label] = {
+            "recall": len(right) / len(expected),
+            # an empty chain asserts nothing, so it cannot be wrong
+            "precision": len(right) / len(found) if found else 1.0,
+            "foreign": float(len({owner.get(i, "noise") for i in found - expected} - {label})),
+        }
+        print(f"[eval] {label}: recall {out[label]['recall']:.0%}, precision {out[label]['precision']:.0%} ({len(found)} links)")
+    return out
+
+
+@pytest.mark.parametrize("nat_hub", [False, True], ids=["fusion-noise", "nat-hub-noise"])
+def test_the_labelled_scenarios_are_recovered_whole_and_clean(nat_hub: bool) -> None:
+    """Every scenario's alerts are found from its first alert, and nothing
+    from another scenario or the noise comes with them.
+
+    Authored scenarios (see the fixture's provenance): a regression bar for
+    the link rules, not a claim about accuracy on real incidents."""
+    result = measure_scenarios(nat_hub=nat_hub)
+    assert {k: v["recall"] for k, v in result.items()} == dict.fromkeys(result, 1.0)
+    assert {k: v["precision"] for k, v in result.items()} == dict.fromkeys(result, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# Strong links: sessions and resolved humans
+# ---------------------------------------------------------------------------
+
+
+def test_alerts_from_one_session_are_linked_with_nothing_else_in_common() -> None:
+    seed = _seed(session_id="sess-1", session_key_kind="vendor_session")
+    other = _mk(1, 5, session_id="sess-1", session_key_kind="vendor_session")
+    chain = _run([seed, other])
+    assert chain is not None
+    assert [link.alert_id for link in chain.chain] == [other.id]
+    assert chain.chain[0].shared_entities == [{"kind": "Session", "value": "sess-1"}]
+
+
+def test_alerts_behind_the_same_resolved_human_are_linked() -> None:
+    seed = _seed(originating_human="Alice@Example.com")
+    other = _mk(1, 5, originating_human="alice@example.com")
+    chain = _run([seed, other])
+    assert chain is not None
+    assert chain.chain[0].shared_entities == [{"kind": "Human", "value": "alice@example.com"}]
+
+
+def test_a_session_we_derived_is_weaker_than_one_the_vendor_named() -> None:
+    def strength(kind: str) -> float:
+        seed = _seed(session_id="s", session_key_kind=kind)
+        other = _mk(1, 5, session_id="s", session_key_kind=kind)
+        chain = _run([seed, other])
+        assert chain is not None
+        return chain.chain[0].strength
+
+    assert strength("derived") < strength("vendor_session")
+
+
+def test_a_session_outweighs_a_string_match() -> None:
+    from app.services.attack_chain import _entity_weight
+
+    session, human = _entity_weight("Session", "s"), _entity_weight("Human", "h")
+    user, host = _entity_weight("Identity", "jdoe"), _entity_weight("Endpoint", "h1")
+    address = _entity_weight("Endpoint", "203.0.113.5")
+    assert session > human > user
+    assert user == host
+    assert host > address
+    assert _entity_weight("DerivedSession", "s") < human  # we made that grouping ourselves
+    assert _entity_weight("Identity", "system") < address  # a shared account says almost nothing
+
+
+def test_a_weak_string_match_does_not_join_an_alert_anchored_on_a_session() -> None:
+    """The story grouper's rule, found there by measurement: once an alert has
+    an authenticated context behind it, a host or address string shared with
+    some other alert is not allowed to pull that alert's neighbours in."""
+    seed = _seed(session_id="s", affected_hosts=("h1",))
+    same_session = _mk(1, 5, session_id="s")
+    just_the_host = _mk(2, 6, affected_hosts=("h1",))
+    chain = _run([seed, same_session, just_the_host])
+    assert chain is not None
+    assert [link.alert_id for link in chain.chain] == [same_session.id]
+    assert chain.weak_links_refused == 1
+    assert chain.to_dict()["weak_links_refused"] == 1
+
+
+def test_a_weak_match_is_fine_when_the_seed_has_no_strong_context() -> None:
+    seed = _seed(affected_hosts=("h1",))
+    other = _mk(1, 5, affected_hosts=("h1",))
+    chain = _run([seed, other])
+    assert chain is not None
+    assert [link.alert_id for link in chain.chain] == [other.id]
+    assert chain.weak_links_refused == 0
+
+
+def test_a_weak_match_that_also_shares_the_session_is_kept() -> None:
+    seed = _seed(session_id="s", affected_hosts=("h1",))
+    other = _mk(1, 5, session_id="s", affected_hosts=("h1",))
+    chain = _run([seed, other])
+    assert chain is not None
+    assert [link.alert_id for link in chain.chain] == [other.id]
+    assert chain.weak_links_refused == 0
+
+
+def test_a_shared_address_cannot_weld_a_noise_alert_onto_a_session_anchored_hop() -> None:
+    seed = _seed(session_id="s")
+    bridge = _mk(1, 5, session_id="s", affected_ips=("203.0.113.5",))
+    noise = _mk(2, 6, affected_ips=("203.0.113.5",))
+    chain = _run([seed, bridge, noise])
+    assert chain is not None
+    assert [link.alert_id for link in chain.chain] == [bridge.id]
+    assert chain.weak_links_refused == 1
+
+
+def test_an_alert_refused_on_one_route_is_found_by_another() -> None:
+    seed = _seed(session_id="s", affected_hosts=("h1",))
+    bridge = _mk(1, 5, session_id="s", originating_human="alice@example.com")
+    # Weak to the seed (a host), but shares the resolved human with the bridge.
+    reached = _mk(2, 6, affected_hosts=("h1",), originating_human="alice@example.com")
+    chain = _run([seed, bridge, reached])
+    assert chain is not None
+    by_id = {link.alert_id: link for link in chain.chain}
+    assert reached.id in by_id
+    assert by_id[reached.id].via_alert_id == bridge.id
+    assert chain.weak_links_refused == 0  # refused on one route, found on another: not "refused"
+
+
+@pytest.mark.parametrize(
+    ("tactics", "techniques", "stage", "tactic"),
+    [
+        (("exfiltration",), (), 12, "exfiltration"),
+        (("Initial Access",), (), 2, "initial-access"),
+        (("privilege_escalation",), (), 5, "privilege-escalation"),
+        (("stealth",), (), 6, "defense-evasion"),
+        (("collection", "exfiltration"), (), 10, "collection"),
+        ((), ("T1567",), 12, "exfiltration"),
+        (("discovery",), ("T1567",), 8, "discovery"),  # the earliest of both sources
+        (("not-a-tactic",), (), None, None),
+    ],
+)
+def test_stage_comes_from_the_alerts_tactics_as_well_as_its_techniques(tactics, techniques, stage, tactic) -> None:
+    seed = _seed(affected_users=("jdoe",))
+    other = _mk(1, 5, affected_users=("jdoe",), mitre_tactics=tactics, mitre_techniques=techniques)
+    chain = _run([seed, other])
+    assert chain is not None
+    assert (chain.chain[0].stage, chain.chain[0].tactic) == (stage, tactic)
