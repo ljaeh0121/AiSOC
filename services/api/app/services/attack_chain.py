@@ -101,6 +101,10 @@ MAX_DEPTH: int = 3
 #: visual signal".
 MAX_CHAIN_LENGTH: int = 50
 
+#: Rows one entity sweep may return. A sweep that finds more keeps the alerts
+#: closest in time to the anchor and the chain reports ``sweep_limit``.
+MAX_SWEEP_ROWS: int = MAX_CHAIN_LENGTH * 2
+
 #: Score weights. These are tuned for "graph distance dominates,
 #: temporal proximity is the next strongest signal, risk overlap is a
 #: tie-breaker that prevents two unrelated incidents on the same host
@@ -465,6 +469,13 @@ class AttackChain:
     entity_graph: dict[str, list[dict[str, Any]]]
     chain_signature: str
     confidence: float
+    #: True when alerts that matched were left out. ``truncated_reasons`` says
+    #: why: ``sweep_limit`` (an entity sweep hit its row limit, so related
+    #: alerts were never read) and/or ``max_length`` (the chain was cut to its
+    #: cap). An empty or short chain with ``truncated`` set is "not all of
+    #: it", never "nothing else is related".
+    truncated: bool = False
+    truncated_reasons: list[str] = field(default_factory=list)
     generated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def to_dict(self) -> dict[str, Any]:
@@ -476,6 +487,8 @@ class AttackChain:
             "entity_graph": self.entity_graph,
             "chain_signature": self.chain_signature,
             "confidence": round(self.confidence, 4),
+            "truncated": self.truncated,
+            "truncated_reasons": self.truncated_reasons,
             "generated_at": self.generated_at.isoformat(),
         }
 
@@ -488,6 +501,10 @@ class AttackChainLoader(Protocol):
     alert in the tenant whose ``event_time`` falls in
     ``[start, end]`` *and* whose entity touch-set intersects the seed
     set passed in.
+
+    A sweep is bounded: it returns the alerts closest in time to ``anchor``
+    (ties broken by id, so the choice is reproducible), at most ``limit`` + 1
+    of them. The extra row is how the caller learns the limit was hit.
     """
 
     async def load_seed(self, alert_id: uuid.UUID, tenant_id: uuid.UUID) -> CandidateAlert | None:
@@ -504,6 +521,9 @@ class AttackChainLoader(Protocol):
         start: datetime,
         end: datetime,
         exclude_ids: set[uuid.UUID],
+        *,
+        limit: int,
+        anchor: datetime,
     ) -> list[CandidateAlert]:
         # See ``load_seed`` — Protocol stubs use ``pass`` to silence
         # ``py/ineffectual-statement`` without changing semantics.
@@ -689,6 +709,7 @@ async def compute_attack_chain(
     window_label: str = "24h",
     max_depth: int = MAX_DEPTH,
     max_length: int = MAX_CHAIN_LENGTH,
+    sweep_limit: int = MAX_SWEEP_ROWS,
     now: datetime | None = None,
 ) -> AttackChain | None:
     """Walk the alert↔entity graph from ``seed_alert_id`` and return a
@@ -718,6 +739,7 @@ async def compute_attack_chain(
     # tied to the seed itself and carry no intermediary.
     via_of: dict[uuid.UUID, tuple[uuid.UUID | None, set[tuple[str, str]]]] = {}
     by_depth: dict[int, list[CandidateAlert]] = {0: [seed]}
+    sweep_truncated = False
 
     for depth in range(1, max_depth + 1):
         frontier -= seen_entities
@@ -730,7 +752,16 @@ async def compute_attack_chain(
             start=start,
             end=end,
             exclude_ids=set(known.keys()),
+            limit=sweep_limit,
+            anchor=anchor,
         )
+        # Order here too rather than trust the loader: which alerts survive a
+        # full sweep must not depend on the order a database happened to
+        # return them in.
+        rows = sorted(rows, key=lambda r: (abs((r.event_time - anchor).total_seconds()), str(r.id)))
+        if len(rows) > sweep_limit:
+            rows = rows[:sweep_limit]
+            sweep_truncated = True
         next_frontier: set[tuple[str, str]] = set()
         for row in rows:
             if row.id in known:
@@ -786,6 +817,7 @@ async def compute_attack_chain(
     # into attack-stage order (stage, then time, then id for determinism) so
     # the timeline reads as an intrusion narrative.
     chain.sort(key=lambda link: (-link.score, link.event_time, str(link.alert_id)))
+    length_truncated = len(chain) > max_length
     chain = chain[:max_length]
     chain.sort(key=lambda link: (_stage_index(candidate_index[link.alert_id]), link.event_time, str(link.alert_id)))
 
@@ -804,6 +836,8 @@ async def compute_attack_chain(
         entity_graph=entity_graph,
         chain_signature=signature,
         confidence=confidence,
+        truncated=sweep_truncated or length_truncated,
+        truncated_reasons=[reason for reason, hit in (("sweep_limit", sweep_truncated), ("max_length", length_truncated)) if hit],
     )
 
 
@@ -839,8 +873,11 @@ class PostgresAttackChainLoader:
         start: datetime,
         end: datetime,
         exclude_ids: set[uuid.UUID],
+        *,
+        limit: int,
+        anchor: datetime,
     ) -> list[CandidateAlert]:
-        from sqlalchemy import and_, or_, select, text
+        from sqlalchemy import and_, func, or_, select, text
 
         from app.models.alert import Alert
 
@@ -884,7 +921,11 @@ class PostgresAttackChainLoader:
                     or_(*clauses),
                 )
             )
-            .limit(MAX_CHAIN_LENGTH * 2)
+            # Closest to the anchor first, id as the tie-break: without an
+            # ORDER BY a LIMIT returns whichever rows the planner met first,
+            # and the same sweep could keep different alerts on each call.
+            .order_by(func.abs(func.extract("epoch", Alert.event_time - anchor)), Alert.id)
+            .limit(limit + 1)
         )
         if exclude_ids:
             stmt = stmt.where(Alert.id.notin_(list(exclude_ids)))

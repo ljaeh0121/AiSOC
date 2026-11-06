@@ -153,6 +153,9 @@ class _InMemoryLoader:
         start: datetime,
         end: datetime,
         exclude_ids: set[uuid.UUID],
+        *,
+        limit: int | None = None,
+        anchor: datetime | None = None,
     ) -> list[CandidateAlert]:
         ents = set(entities)
         out: list[CandidateAlert] = []
@@ -165,7 +168,10 @@ class _InMemoryLoader:
                 continue
             if row.entities() & ents:
                 out.append(row)
-        return out
+        if anchor is not None:
+            out.sort(key=lambda r: (abs((r.event_time - anchor).total_seconds()), str(r.id)))
+        # Contract: at most ``limit`` + 1 rows, the extra one only signals overflow.
+        return out[: limit + 1] if limit is not None else out
 
 
 # ---------------------------------------------------------------------------
@@ -453,27 +459,16 @@ def test_chain_signature_helper_pure_seed_only_chain() -> None:
 
 
 class _RecordingLoader(_InMemoryLoader):
-    """In-memory loader that records every entity set it is asked about and
-    can truncate each answer the way the production ``LIMIT`` does."""
+    """In-memory loader that records every entity set it is asked about."""
 
-    def __init__(self, alerts: list[CandidateAlert], *, per_call_limit: int | None = None) -> None:
+    def __init__(self, alerts: list[CandidateAlert]) -> None:
         super().__init__(alerts)
         self.calls: list[set[tuple[str, str]]] = []
-        self._limit = per_call_limit
 
-    async def load_candidates_for_entities(
-        self,
-        tenant_id: uuid.UUID,
-        entities: Iterable[tuple[str, str]],
-        start: datetime,
-        end: datetime,
-        exclude_ids: set[uuid.UUID],
-    ) -> list[CandidateAlert]:
+    async def load_candidates_for_entities(self, tenant_id, entities, *a, **k) -> list[CandidateAlert]:
         ents = set(entities)
         self.calls.append(ents)
-        rows = await super().load_candidates_for_entities(tenant_id, ents, start, end, exclude_ids)
-        rows.sort(key=lambda r: r.event_time)
-        return rows[: self._limit] if self._limit else rows
+        return await super().load_candidates_for_entities(tenant_id, ents, *a, **k)
 
 
 def _run(alerts: list[CandidateAlert], loader: _InMemoryLoader | None = None, **kw):
@@ -521,8 +516,8 @@ def test_an_entity_is_never_queried_twice() -> None:
         affected_users=("jdoe",),
         affected_hosts=("hostx",),
     )
-    loader = _RecordingLoader([seed, a, b, c], per_call_limit=1)
-    assert _run([], loader) is not None
+    loader = _RecordingLoader([seed, a, b, c])
+    assert _run([], loader, sweep_limit=1) is not None
     queried = [e for call in loader.calls for e in call]
     assert len(queried) == len(set(queried)), queried
 
@@ -627,3 +622,84 @@ def test_loader_exception_propagates() -> None:
 
     with pytest.raises(RuntimeError, match="db down"):
         _run([], _Broken(_build_lockbit_chain()))
+
+
+# ---------------------------------------------------------------------------
+# Truncation is reported, never silent
+# ---------------------------------------------------------------------------
+
+
+def _same_user_alerts(n: int) -> list[CandidateAlert]:
+    return [
+        CandidateAlert(
+            id=uuid.UUID(int=i + 1),
+            tenant_id=TENANT,
+            title=f"a{i}",
+            severity="high",
+            event_time=T0 + timedelta(minutes=10 * (i + 1)),
+            affected_users=("jdoe@acme.test",),
+        )
+        for i in range(n)
+    ]
+
+
+def _seed_for(alerts: list[CandidateAlert]) -> CandidateAlert:
+    return CandidateAlert(id=SEED_ID, tenant_id=TENANT, title="seed", severity="high", event_time=T0, affected_users=("jdoe@acme.test",))
+
+
+def test_a_complete_chain_is_not_marked_truncated() -> None:
+    chain = _run(_build_lockbit_chain())
+    assert chain is not None
+    assert chain.truncated is False
+    assert chain.truncated_reasons == []
+    assert chain.to_dict()["truncated"] is False
+
+
+def test_a_sweep_that_hits_its_limit_says_so_and_keeps_the_closest_alerts() -> None:
+    others = _same_user_alerts(5)
+    chain = _run([_seed_for(others), *others], sweep_limit=3)
+    assert chain is not None
+    assert chain.truncated is True
+    assert chain.truncated_reasons == ["sweep_limit"]
+    # the three closest to the seed in time survive, not an arbitrary three
+    assert {link.alert_id for link in chain.chain} == {o.id for o in others[:3]}
+    assert chain.to_dict()["truncated_reasons"] == ["sweep_limit"]
+
+
+def test_a_sweep_that_exactly_fits_its_limit_is_not_truncated() -> None:
+    others = _same_user_alerts(3)
+    chain = _run([_seed_for(others), *others], sweep_limit=3)
+    assert chain is not None
+    assert chain.truncated is False
+    assert len(chain.chain) == 3
+
+
+def test_which_alerts_survive_a_truncated_sweep_is_deterministic() -> None:
+    tied = [
+        CandidateAlert(
+            id=uuid.UUID(int=100 - i),
+            tenant_id=TENANT,
+            title=f"t{i}",
+            severity="high",
+            event_time=T0 + timedelta(minutes=5),  # identical distance from the seed
+            affected_users=("jdoe@acme.test",),
+        )
+        for i in range(4)
+    ]
+    runs = [_run([_seed_for(tied), *reversed(tied)] if k else [_seed_for(tied), *tied], sweep_limit=2) for k in (0, 1)]
+    assert runs[0] is not None and runs[1] is not None
+    assert runs[0].chain_signature == runs[1].chain_signature
+
+
+def test_the_length_cap_is_reported_too() -> None:
+    chain = _run(_build_lockbit_chain(), max_length=2)
+    assert chain is not None
+    assert chain.truncated is True
+    assert chain.truncated_reasons == ["max_length"]
+
+
+def test_both_reasons_can_apply_at_once() -> None:
+    others = _same_user_alerts(6)
+    chain = _run([_seed_for(others), *others], sweep_limit=4, max_length=2)
+    assert chain is not None
+    assert chain.truncated_reasons == ["sweep_limit", "max_length"]

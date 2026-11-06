@@ -4,9 +4,12 @@ Exposes the ranked timeline computed by
 ``services/api/app/services/attack_chain.py`` to the case-detail UI.
 
 ``GET /v1/cases/{case_id}/attack-chain?window=24h``
-    Returns a ranked chain of alerts that share entities with the
-    seed alert anchored to this case, plus the side-by-side entity
-    graph the right column renders.
+    Returns the alerts that share entities with the seed alert anchored
+    to this case, in ATT&CK stage order, plus the side-by-side entity
+    graph the right column renders. ``truncated`` / ``truncated_reasons``
+    say when matching alerts were left out; a short chain with
+    ``truncated`` set is not evidence that nothing else is related.
+    Read-only: a request writes nothing.
 
 The endpoint is tenant-scoped via the existing RLS dependency stack
 (``AuthUser`` + ``DBSession``). The seed alert is resolved as the
@@ -127,6 +130,8 @@ async def get_attack_chain(
             "entity_graph": {"nodes": [], "edges": []},
             "chain_signature": None,
             "confidence": 0.0,
+            "truncated": False,
+            "truncated_reasons": [],
             "reason": "case_has_no_linked_alerts",
         }
 
@@ -147,56 +152,14 @@ async def get_attack_chain(
     if chain is None:
         raise HTTPException(status_code=404, detail="seed_alert_not_found")
 
-    # Persist the materialised chain so subsequent navigations skip the
-    # BFS. The unique constraint on (tenant, seed, window, signature)
-    # makes this an atomic upsert when the chain hasn't changed.
-    try:
-        await db.execute(
-            text(
-                """
-                INSERT INTO aisoc_attack_chains (
-                    tenant_id, seed_alert_id, case_id, "window",
-                    chain, entity_graph, chain_signature, confidence,
-                    updated_at
-                ) VALUES (
-                    :tenant_id, :seed_alert_id, :case_id, :window,
-                    CAST(:chain AS JSONB), CAST(:entity_graph AS JSONB),
-                    :signature, :confidence, NOW()
-                )
-                ON CONFLICT (tenant_id, seed_alert_id, "window", chain_signature)
-                DO UPDATE SET
-                    case_id      = EXCLUDED.case_id,
-                    chain        = EXCLUDED.chain,
-                    entity_graph = EXCLUDED.entity_graph,
-                    confidence   = EXCLUDED.confidence,
-                    updated_at   = NOW()
-                """
-            ),
-            {
-                "tenant_id": str(user.tenant_id),
-                "seed_alert_id": str(chain.seed_alert_id),
-                "case_id": str(case_id),
-                "window": window,
-                "chain": _json_dumps([link.to_dict() for link in chain.chain]),
-                "entity_graph": _json_dumps(chain.entity_graph),
-                "signature": chain.chain_signature,
-                "confidence": chain.confidence,
-            },
-        )
-        await db.commit()
-    except Exception as exc:  # noqa: BLE001 — table may not exist in tests
-        # The migration is the source of truth; if it hasn't been
-        # applied yet (e.g. dev branch, fresh test harness) we still
-        # serve the response — caching is a nice-to-have, not a gate.
-        logger.debug("attack_chain cache write skipped: %s", exc)
+    # Nothing is persisted here. This route used to upsert every computed
+    # chain into ``aisoc_attack_chains``, but nothing reads that table, and
+    # its unique key includes ``chain_signature`` — a value only known after
+    # the traversal — so it could never be looked up to skip the traversal. A
+    # GET that writes an unreadable row per distinct chain is cost without a
+    # consumer. A real cache needs a key knowable before computing (seed,
+    # window) plus an invalidation rule, which is a schema decision.
 
     payload = chain.to_dict()
     payload["case_id"] = str(case_id)
     return payload
-
-
-def _json_dumps(value: Any) -> str:
-    """Stable JSON encoder (sorted keys, UTF-8 default) for cache writes."""
-    import json
-
-    return json.dumps(value, default=str, sort_keys=True)

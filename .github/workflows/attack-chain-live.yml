@@ -1,0 +1,152 @@
+# Attack chain — through the real SQL and real PostgreSQL.
+#
+# Every offline attack-chain test walks an in-memory list, which answers any
+# question the algorithm asks of it. The production loader answers with a
+# `?|` JSONB probe, a tenant filter, a time window and a bounded, ordered
+# LIMIT, and a request through the route must leave the database as it found
+# it. None of that is exercised without a database, and the suites skip when
+# none answers — which is why this job sets ATTACK_CHAIN_PROOF_REQUIRED=1:
+# here, a skip is a failure.
+#
+# No `paths:` filter, for the reason alert-audit-live.yml gives.
+name: Attack chain (live)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: attack-chain-live-${{ github.ref }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  attack-chain-live:
+    name: A sweep is tenant-scoped, bounded, ordered, and says when it was cut
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      # The schema owner. Owners bypass row-level security, so these suites
+      # prove the loader's own tenant filter; isolation-live.yml owns the
+      # policy and connects as the restricted role.
+      # aisoc-db-role: owner — the suites create tenants, users, alerts and cases across tenants; no runtime DSN is set here
+      DATABASE_URL: postgresql+asyncpg://aisoc:aisoc_ci_only@localhost:5432/aisoc
+      DATABASE_MIGRATION_URL: postgresql+asyncpg://aisoc:aisoc_ci_only@localhost:5432/aisoc
+      PGPASSWORD: aisoc_ci_only
+      # Not a bypass environment: the route suite mints a real JWT and goes
+      # through the real auth dependencies.
+      ENVIRONMENT: production
+      SECRET_KEY: ci-attack-chain-signing-secret-at-least-32-chars
+      ATTACK_CHAIN_PROOF_REQUIRED: "1"
+      OTEL_SDK_DISABLED: "true"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Start PostgreSQL with registry fallback
+        uses: ./.github/actions/start-postgres
+        with:
+          password: aisoc_ci_only
+
+      - uses: actions/setup-python@e9d6f990972a57673cdb72ec29e19d42ba28880f # v6
+        with:
+          python-version: "3.11"
+
+      - name: Install api from its lockfile
+        working-directory: services/api
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet --upgrade pip "poetry==2.4.1"
+          poetry config virtualenvs.create false
+          poetry install --no-root --no-interaction
+          python -m pip install --quiet pytest pytest-asyncio
+
+      - name: Apply every migration, in order
+        run: |
+          for f in services/api/migrations/*.sql; do
+            psql -h localhost -U aisoc -d aisoc -v ON_ERROR_STOP=1 -q -f "$f"
+          done
+
+      - name: The sweep and the route behave against real rows
+        working-directory: services/api
+        run: |
+          python -m pytest \
+            tests/test_attack_chain_live_postgres.py \
+            tests/test_attack_chain_endpoint_live.py \
+            -v --tb=short
+
+      # ── Negative controls ──────────────────────────────────────────────
+      #
+      # Each puts a defect back and requires the matching assertion to go
+      # red. Without them a suite that stopped exercising the path would stay
+      # green forever.
+
+      - name: Removing the tenant filter makes the isolation proof fail
+        working-directory: services/api
+        run: |
+          cp app/services/attack_chain.py /tmp/attack_chain.bak
+          python - <<'PY'
+          import pathlib, sys
+          p = pathlib.Path("app/services/attack_chain.py")
+          s = p.read_text()
+          needle = "                    Alert.tenant_id == tenant_id,\n                    Alert.event_time >= start,"
+          if needle not in s:
+              print("negative control: candidate-sweep tenant filter not found — the loader has been reshaped")
+              sys.exit(1)
+          p.write_text(s.replace(needle, "                    Alert.event_time >= start,", 1))
+          PY
+          if python -m pytest tests/test_attack_chain_live_postgres.py -q >/dev/null 2>&1; then
+            cp /tmp/attack_chain.bak app/services/attack_chain.py
+            echo "FAIL: the suite passed with the candidate sweep not scoped to the tenant."
+            exit 1
+          fi
+          cp /tmp/attack_chain.bak app/services/attack_chain.py
+          echo "OK: dropping the tenant filter makes the suite fail, as it must."
+
+      - name: Removing the ORDER BY makes the truncation proof fail
+        working-directory: services/api
+        run: |
+          cp app/services/attack_chain.py /tmp/attack_chain.bak
+          python - <<'PY'
+          import pathlib, sys
+          p = pathlib.Path("app/services/attack_chain.py")
+          s = p.read_text()
+          needle = '            .order_by(func.abs(func.extract("epoch", Alert.event_time - anchor)), Alert.id)\n'
+          if needle not in s:
+              print("negative control: sweep ORDER BY not found — the loader has been reshaped")
+              sys.exit(1)
+          p.write_text(s.replace(needle, "", 1))
+          PY
+          if python -m pytest tests/test_attack_chain_live_postgres.py -q >/dev/null 2>&1; then
+            cp /tmp/attack_chain.bak app/services/attack_chain.py
+            echo "FAIL: the suite passed with the sweep LIMIT unordered."
+            exit 1
+          fi
+          cp /tmp/attack_chain.bak app/services/attack_chain.py
+          echo "OK: an unordered LIMIT makes the suite fail, as it must."
+
+      - name: Dropping the overflow row makes the truncation proof fail
+        working-directory: services/api
+        run: |
+          cp app/services/attack_chain.py /tmp/attack_chain.bak
+          python - <<'PY'
+          import pathlib, sys
+          p = pathlib.Path("app/services/attack_chain.py")
+          s = p.read_text()
+          needle = ".limit(limit + 1)"
+          if needle not in s:
+              print("negative control: overflow-row LIMIT not found — the loader has been reshaped")
+              sys.exit(1)
+          p.write_text(s.replace(needle, ".limit(limit)", 1))
+          PY
+          if python -m pytest tests/test_attack_chain_live_postgres.py -q >/dev/null 2>&1; then
+            cp /tmp/attack_chain.bak app/services/attack_chain.py
+            echo "FAIL: the suite passed with the overflow row dropped."
+            exit 1
+          fi
+          cp /tmp/attack_chain.bak app/services/attack_chain.py
+          echo "OK: dropping the overflow row makes the suite fail, as it must."
